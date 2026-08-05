@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Central Brain local databases and runtime episodes
+db/*.db
+db/*.db-wal
+db/*.db-shm
+episodes/*.md
+facts.json
+sources.json
+.working_memory
+.memory/
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
