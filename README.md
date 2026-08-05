@@ -117,6 +117,14 @@ response = chat(
 print(response['message']['content'])
 ```
 
+### 4. Custom Ollama Modelfile ([`Modelfile.example`](Modelfile.example))
+Create custom Ollama models with pre-baked Central Brain system directives:
+```bash
+# Create a local agent model configured with Central Brain directives
+ollama create brain-agent -f Modelfile.example
+ollama run brain-agent
+```
+
 ---
 
 ## 🐚 Shell Working Memory Persistence (`MEMORY_SETUP.md`)
