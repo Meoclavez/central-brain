@@ -161,15 +161,24 @@ def ingest_file(file_path: Path):
 
     conn = get_db()
     str_path = str(file_path)
+    file_content_hash = hashlib.sha256(content.encode('utf-8')).hexdigest()
+
+    # Incremental check: if file content hasn't changed, skip re-embedding
+    existing = conn.execute("SELECT COUNT(*), hash FROM chunks WHERE file_path = ?", (str_path,)).fetchall()
+    if existing and existing[0][0] > 0:
+        first_hash = existing[0][1] or ""
+        if first_hash.startswith(f"{file_content_hash}:"):
+            return existing[0][0] # No changes detected, return existing chunk count
+
     chunks = chunk_markdown(content, str_path)
     ingested_count = 0
 
     with conn:
-        # Clear existing chunks for this file
+        # Atomic replacement: Delete old chunks for this file (FTS triggers auto-delete from FTS index)
         conn.execute("DELETE FROM chunks WHERE file_path = ?", (str_path,))
 
-        for header, chunk_text in chunks:
-            chunk_hash = hashlib.sha256(f"{str_path}:{header}:{chunk_text}".encode('utf-8')).hexdigest()
+        for idx, (header, chunk_text) in enumerate(chunks):
+            chunk_hash = f"{file_content_hash}:{idx}:{hashlib.sha256(chunk_text.encode('utf-8')).hexdigest()[:16]}"
             vec = get_embedding(f"{header}\n{chunk_text}")
             vec_blob = json.dumps(vec) if vec else None
 
@@ -383,6 +392,43 @@ def run_mcp_server():
         except Exception as e:
             sys.stderr.write(f"MCP Exception: {e}\n")
 
+def clean_orphans():
+    """Finds indexed files that no longer exist on disk and purges their chunks & vectors."""
+    conn = get_db()
+    rows = conn.execute("SELECT DISTINCT file_path FROM chunks").fetchall()
+    deleted_files = 0
+    deleted_chunks = 0
+
+    with conn:
+        for r in rows:
+            fp_str = r['file_path']
+            if not Path(fp_str).exists():
+                c_cnt = conn.execute("SELECT COUNT(*) FROM chunks WHERE file_path = ?", (fp_str,)).fetchone()[0]
+                conn.execute("DELETE FROM chunks WHERE file_path = ?", (fp_str,))
+                deleted_files += 1
+                deleted_chunks += c_cnt
+
+    return deleted_files, deleted_chunks
+
+def prune_brain():
+    """Cleans orphan files, deduplicates facts, and vacuums the SQLite database."""
+    conn = get_db()
+    orphans_files, orphan_chunks = clean_orphans()
+
+    # Deduplicate facts table
+    with conn:
+        conn.execute("""
+            DELETE FROM facts WHERE id NOT IN (
+                SELECT MIN(id) FROM facts GROUP BY entity, category, fact
+            )
+        """)
+
+    conn.isolation_level = None
+    conn.execute("VACUUM;")
+    conn.isolation_level = ""
+
+    return orphans_files, orphan_chunks
+
 def sync_brain():
     """Scans all registered directories/files and updates modified content in vector DB."""
     sources_file = BRAIN_DIR / "sources.json"
@@ -419,7 +465,10 @@ def sync_brain():
             total_chunks += cnt
             synced_paths += 1
 
-    return synced_paths, total_chunks
+    # Clean up files deleted from disk
+    orphan_files, orphan_chunks = clean_orphans()
+
+    return synced_paths, total_chunks, orphan_files, orphan_chunks
 
 def main():
     parser = argparse.ArgumentParser(description="Central Brain - Unified Local Agent Memory CLI")
@@ -443,6 +492,9 @@ def main():
 
     # sync
     sub.add_parser("sync", help="Sync all registered knowledge bases & files")
+
+    # prune
+    sub.add_parser("prune", help="Clean deleted files, deduplicate facts, and reclaim disk space")
 
     # status
     sub.add_parser("status", help="Display Central Brain metrics")
@@ -488,8 +540,15 @@ def main():
             print(f"❌ Error: Path '{args.path}' does not exist.")
 
     elif args.command == "sync":
-        paths, chunks = sync_brain()
-        print(f"🔄 Central Brain Sync Complete: Processed {paths} source paths ({chunks} total chunks indexed).")
+        paths, chunks, del_files, del_chunks = sync_brain()
+        msg = f"🔄 Central Brain Sync Complete: Processed {paths} sources ({chunks} total chunks active)."
+        if del_files > 0:
+            msg += f" Purged {del_files} deleted files ({del_chunks} orphan chunks removed)."
+        print(msg)
+
+    elif args.command == "prune":
+        del_files, del_chunks = prune_brain()
+        print(f"🧹 Central Brain Prune Complete: Cleaned {del_files} deleted files ({del_chunks} chunks removed). Fact table deduplicated and database vacuumed.")
 
     elif args.command == "status":
         st = get_status()
