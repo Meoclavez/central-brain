@@ -12,7 +12,13 @@ The `brain` tool is NOT an LLM function/tool call. It is an executable CLI binar
    - Immediately after solving a problem, fixing a bug, or updating a config, execute the bash command:
      `brain remember "<fact/solution>" --entity "<Topic>" --category "<Fix|Rule|Knowledge|Project>"`
 
-3. **INGEST, SYNC & PRUNE KNOWLEDGE (BASH)**:
+3. **CORRECT & INVALIDATE OUTDATED MEMORIES (BASH)**:
+   - When a previous finding or assumption is discovered to be wrong, execute:
+     `brain correct "<entity>" "<new_finding>" --category "<Fix|Rule|Knowledge|Project>"`
+   - To completely remove an invalid or false memory, execute:
+     `brain forget "<keyword/target>"`
+
+4. **INGEST, SYNC & PRUNE KNOWLEDGE (BASH)**:
    - When creating or updating project documentation, execute:
      `brain ingest <path>`
      `brain sync`
@@ -20,5 +26,5 @@ The `brain` tool is NOT an LLM function/tool call. It is an executable CLI binar
      `brain prune`
      (Purges orphan files deleted from disk, deduplicates facts, and vacuums SQLite storage).
 
-4. **EMPIRICAL ANSWERS**:
+5. **EMPIRICAL ANSWERS**:
    - Base technical decisions on actual outputs returned from `brain query` and terminal commands.

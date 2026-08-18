@@ -73,11 +73,20 @@ brain query "how to fix bluetooth on arch"
 # Remember a new decision or fix across sessions
 brain remember "Realtek Wi-Fi power save set to 2" --entity "Wi-Fi" --category "Fix"
 
+# Correct/supersede an earlier finding with an updated solution
+brain correct "Wi-Fi" "Realtek Wi-Fi fix is setting rtw89 aspm disabled" --category "Fix"
+
+# Erase an invalid, false, or obsolete memory completely
+brain forget "temporary false assumption" --entity "Wi-Fi"
+
 # Ingest a new Markdown document or project folder
 brain ingest /path/to/project/
 
 # Sync all registered directories listed in sources.json
 brain sync
+
+# Clean deleted files, deduplicate facts, and vacuum DB
+brain prune
 
 # View database health & stats
 brain status

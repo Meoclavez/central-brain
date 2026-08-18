@@ -282,6 +282,59 @@ def remember(fact: str, entity: str = "General", category: str = "Knowledge", so
     ingest_file(today_file)
     return True
 
+def forget(target: str, entity: str = None):
+    """Deletes matching facts and records an invalidation log in today's episode file."""
+    conn = get_db()
+    deleted_count = 0
+    with conn:
+        if entity and entity != "General":
+            cur = conn.execute("DELETE FROM facts WHERE entity = ? AND (fact LIKE ? OR ? = '')", (entity, f"%{target}%", target))
+            deleted_count = cur.rowcount
+        else:
+            cur = conn.execute("DELETE FROM facts WHERE fact LIKE ? OR entity LIKE ?", (f"%{target}%", f"%{target}%"))
+            deleted_count = cur.rowcount
+
+    # Append invalidation log to today's episode file
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_file = EPISODES_DIR / f"{today_str}.md"
+    mode = "a" if today_file.exists() else "w"
+    with open(today_file, mode, encoding="utf-8") as f:
+        if mode == "w":
+            f.write(f"# Agent Episode Log - {today_str}\n\n")
+        time_str = datetime.now().strftime("%H:%M:%S")
+        target_info = f"'{target}'" if target else f"entity '{entity}'"
+        f.write(f"- [{time_str}] **[Invalidated/Forgotten]** ({entity or 'General'}): Purged outdated/incorrect memory matching {target_info}\n")
+
+    ingest_file(today_file)
+    return deleted_count
+
+def correct(entity: str, new_fact: str, old_fact_search: str = None, category: str = "Fix", source: str = "Agent"):
+    """Corrects/supersedes an existing memory with a new finding."""
+    conn = get_db()
+    with conn:
+        if old_fact_search:
+            conn.execute("DELETE FROM facts WHERE entity = ? AND fact LIKE ?", (entity, f"%{old_fact_search}%"))
+        else:
+            conn.execute("DELETE FROM facts WHERE entity = ? AND category = ?", (entity, category))
+
+        conn.execute(
+            "INSERT INTO facts (entity, category, fact, source) VALUES (?, ?, ?, ?)",
+            (entity, category, new_fact, source)
+        )
+
+    # Append correction log to today's episode file
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_file = EPISODES_DIR / f"{today_str}.md"
+    mode = "a" if today_file.exists() else "w"
+    with open(today_file, mode, encoding="utf-8") as f:
+        if mode == "w":
+            f.write(f"# Agent Episode Log - {today_str}\n\n")
+        time_str = datetime.now().strftime("%H:%M:%S")
+        f.write(f"- [{time_str}] **[Correction]** ({entity}): {new_fact} (Supersedes prior finding, via {source})\n")
+
+    ingest_file(today_file)
+    return True
+
 def get_status():
     conn = get_db()
     total_chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
@@ -361,6 +414,32 @@ def run_mcp_server():
                                 }
                             },
                             {
+                                "name": "brain_forget",
+                                "description": "Remove wrong or outdated facts from the Central Brain.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "target": {"type": "string", "description": "Search term or keyword to delete"},
+                                        "entity": {"type": "string", "description": "Optional entity name"}
+                                    },
+                                    "required": ["target"]
+                                }
+                            },
+                            {
+                                "name": "brain_correct",
+                                "description": "Correct/supersede an existing memory or fact with a new finding.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "entity": {"type": "string", "description": "Entity or topic to correct"},
+                                        "new_fact": {"type": "string", "description": "The new corrected fact or solution"},
+                                        "old_fact_search": {"type": "string", "description": "Optional keyword of the old fact to replace"},
+                                        "category": {"type": "string", "default": "Fix"}
+                                    },
+                                    "required": ["entity", "new_fact"]
+                                }
+                            },
+                            {
                                 "name": "brain_status",
                                 "description": "Get current status and statistics of the Central Brain.",
                                 "inputSchema": {"type": "object", "properties": {}}
@@ -379,6 +458,12 @@ def run_mcp_server():
                 elif name == "brain_remember":
                     remember(args.get("fact"), args.get("entity", "General"), args.get("category", "Knowledge"))
                     resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": "Fact saved to Central Brain successfully."}]}}
+                elif name == "brain_forget":
+                    cnt = forget(args.get("target"), args.get("entity"))
+                    resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": f"Purged {cnt} matching facts from Central Brain."}]}}
+                elif name == "brain_correct":
+                    correct(args.get("entity"), args.get("new_fact"), args.get("old_fact_search"), args.get("category", "Fix"))
+                    resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": f"Successfully corrected memory for entity '{args.get('entity')}'."}]}}
                 elif name == "brain_status":
                     res = get_status()
                     resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": json.dumps(res, indent=2)}]}}
@@ -486,6 +571,19 @@ def main():
     r_p.add_argument("-c", "--category", type=str, default="Knowledge", help="Category (Knowledge/Fix/Rule/Project)")
     r_p.add_argument("-s", "--source", type=str, default="CLI", help="Source agent/user")
 
+    # forget
+    f_p = sub.add_parser("forget", help="Remove wrong or outdated memory from the central brain")
+    f_p.add_argument("target", type=str, help="Search term/phrase of the fact to remove")
+    f_p.add_argument("-e", "--entity", type=str, default=None, help="Specific entity/topic filter")
+
+    # correct
+    c_p = sub.add_parser("correct", help="Correct/supersede a memory with a new finding")
+    c_p.add_argument("entity", type=str, help="Entity or topic name")
+    c_p.add_argument("new_fact", type=str, help="The new, corrected fact or solution")
+    c_p.add_argument("-o", "--old", type=str, default=None, help="Old keyword or fact to replace")
+    c_p.add_argument("-c", "--category", type=str, default="Fix", help="Category (Fix/Rule/Knowledge/Project)")
+    c_p.add_argument("-s", "--source", type=str, default="CLI", help="Source agent/user")
+
     # ingest
     i_p = sub.add_parser("ingest", help="Ingest markdown file or directory into vector index")
     i_p.add_argument("path", type=str, help="File or directory path to ingest")
@@ -527,6 +625,14 @@ def main():
     elif args.command == "remember":
         remember(args.fact, args.entity, args.category, args.source)
         print(f"✅ Saved memory to Central Brain: [{args.category}] ({args.entity}): {args.fact}")
+
+    elif args.command == "forget":
+        cnt = forget(args.target, args.entity)
+        print(f"🗑️ Central Brain: Purged {cnt} matching facts matching '{args.target}' (Entity: {args.entity or 'Any'}).")
+
+    elif args.command == "correct":
+        correct(args.entity, args.new_fact, args.old, args.category, args.source)
+        print(f"✨ Central Brain: Successfully corrected memory for [{args.category}] ({args.entity}) -> {args.new_fact}")
 
     elif args.command == "ingest":
         p = Path(args.path).resolve()
