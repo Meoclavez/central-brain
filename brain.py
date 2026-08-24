@@ -335,6 +335,109 @@ def correct(entity: str, new_fact: str, old_fact_search: str = None, category: s
     ingest_file(today_file)
     return True
 
+def run_graphify(target_path: Path = None, code_only: bool = True, backend: str = "ollama"):
+    """Extracts a deterministic AST code knowledge graph using Graphify and indexes it into the Central Brain."""
+    import subprocess
+    target = Path(target_path).resolve() if target_path else Path.cwd()
+    if not target.exists():
+        return False, f"Target path {target} does not exist."
+
+    cmd = ["graphify", "extract", str(target)]
+    if code_only:
+        cmd.append("--code-only")
+    else:
+        cmd.extend(["--backend", backend])
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        out = proc.stdout + proc.stderr
+        graph_out = target / "graphify-out"
+        graph_json = graph_out / "graph.json"
+
+        indexed_chunks = 0
+        if graph_json.exists():
+            indexed_chunks = ingest_file(graph_json)
+            report_md = graph_out / "GRAPH_REPORT.md"
+            if report_md.exists():
+                indexed_chunks += ingest_file(report_md)
+        return True, f"Graphify extraction complete. Generated graph.json ({indexed_chunks} chunks indexed into Central Brain).\n{out.strip()}"
+    except Exception as e:
+        return False, f"Graphify execution failed: {e}"
+
+def get_god_nodes(target_path: Path = None, top_n: int = 10):
+    """Retrieves the most connected architectural hub nodes from graph.json."""
+    import subprocess
+    g_path = None
+    if target_path:
+        p = Path(target_path).resolve()
+        if (p / "graphify-out" / "graph.json").exists():
+            g_path = p / "graphify-out" / "graph.json"
+        elif p.name == "graph.json" and p.exists():
+            g_path = p
+
+    cmd = ["graphify", "god-nodes", "--top", str(top_n)]
+    if g_path:
+        cmd.extend(["--graph", str(g_path)])
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        return proc.stdout.strip()
+    except Exception as e:
+        return f"Error querying god nodes: {e}"
+
+def query_graph_connections(symbol: str, target_path: Path = None):
+    """Finds callers, callees, and dependencies for a symbol from graph.json."""
+    g_path = None
+    if target_path:
+        p = Path(target_path).resolve()
+        g_path = (p / "graphify-out" / "graph.json") if (p / "graphify-out" / "graph.json").exists() else (p if p.name == "graph.json" else None)
+
+    if not g_path or not g_path.exists():
+        matches = list(Path.home().glob("**/graphify-out/graph.json"))
+        if matches:
+            g_path = matches[0]
+        else:
+            return f"No graph.json found. Run 'brain graph <project_path>' first."
+
+    try:
+        with open(g_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        nodes = {n["id"]: n.get("label", n["id"]) for n in data.get("nodes", [])}
+        clean_sym = symbol.strip().lower().replace("()", "")
+        callers = []
+        callees = []
+
+        links = data.get("links", data.get("edges", []))
+        for e in links:
+            src_id = str(e.get("source", "")).lower()
+            tgt_id = str(e.get("target", "")).lower()
+            src_name = nodes.get(e.get("source"), e.get("source"))
+            tgt_name = nodes.get(e.get("target"), e.get("target"))
+            rel = e.get("relation", "calls")
+            loc = f" ({e.get('source_file','')}:{e.get('source_location','')})" if e.get('source_file') else ""
+
+            if clean_sym in tgt_id or clean_sym in str(tgt_name).lower():
+                callers.append(f"{src_name} --[{rel}]--> {tgt_name}{loc}")
+            elif clean_sym in src_id or clean_sym in str(src_name).lower():
+                callees.append(f"{src_name} --[{rel}]--> {tgt_name}{loc}")
+
+        res = [f"📊 GRAPH CONNECTIONS FOR '{symbol}' (from {g_path.parent.parent.name}):"]
+        if callers:
+            res.append("\nIncoming Calls / Usages (Who calls/uses this):")
+            for c in callers[:15]:
+                res.append(f"  • {c}")
+        if callees:
+            res.append("\nOutgoing Calls / Dependencies (What this calls):")
+            for c in callees[:15]:
+                res.append(f"  • {c}")
+        if not callers and not callees:
+            res.append(f"No direct edges found for '{symbol}'.")
+
+        return "\n".join(res)
+    except Exception as e:
+        return f"Error reading graph connections: {e}"
+
 def get_status():
     conn = get_db()
     total_chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
@@ -440,6 +543,28 @@ def run_mcp_server():
                                 }
                             },
                             {
+                                "name": "brain_graph",
+                                "description": "Extract a deterministic AST code knowledge graph using Graphify and index it into the Central Brain.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "path": {"type": "string", "description": "Project directory path to graph"},
+                                        "code_only": {"type": "boolean", "default": True}
+                                    }
+                                }
+                            },
+                            {
+                                "name": "brain_god_nodes",
+                                "description": "List the most connected architectural hub nodes in a project codebase.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "path": {"type": "string", "description": "Optional project path"},
+                                        "top_n": {"type": "integer", "default": 10}
+                                    }
+                                }
+                            },
+                            {
                                 "name": "brain_status",
                                 "description": "Get current status and statistics of the Central Brain.",
                                 "inputSchema": {"type": "object", "properties": {}}
@@ -464,6 +589,12 @@ def run_mcp_server():
                 elif name == "brain_correct":
                     correct(args.get("entity"), args.get("new_fact"), args.get("old_fact_search"), args.get("category", "Fix"))
                     resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": f"Successfully corrected memory for entity '{args.get('entity')}'."}]}}
+                elif name == "brain_graph":
+                    ok, msg = run_graphify(args.get("path"), args.get("code_only", True))
+                    resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": msg}]}}
+                elif name == "brain_god_nodes":
+                    res = get_god_nodes(args.get("path"), args.get("top_n", 10))
+                    resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": res}]}}
                 elif name == "brain_status":
                     res = get_status()
                     resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": json.dumps(res, indent=2)}]}}
@@ -588,6 +719,21 @@ def main():
     i_p = sub.add_parser("ingest", help="Ingest markdown file or directory into vector index")
     i_p.add_argument("path", type=str, help="File or directory path to ingest")
 
+    # graph
+    g_p = sub.add_parser("graph", help="Extract AST code knowledge graph using Graphify and index into Central Brain")
+    g_p.add_argument("path", nargs="?", default=".", help="Project directory to graph (default: current dir)")
+    g_p.add_argument("--deep", action="store_true", help="Run full semantic multimodal extraction via local LLM")
+
+    # god-nodes
+    gn_p = sub.add_parser("god-nodes", help="List architectural code hubs and most connected modules")
+    gn_p.add_argument("path", nargs="?", default=None, help="Optional project directory or path to graph.json")
+    gn_p.add_argument("-n", "--top", type=int, default=10, help="Number of nodes to show (default: 10)")
+
+    # callers
+    cl_p = sub.add_parser("callers", help="Find callers, callees, and dependencies for a symbol")
+    cl_p.add_argument("symbol", type=str, help="Function, class, or module name to query")
+    cl_p.add_argument("path", nargs="?", default=None, help="Optional project directory or graph.json path")
+
     # sync
     sub.add_parser("sync", help="Sync all registered knowledge bases & files")
 
@@ -633,6 +779,19 @@ def main():
     elif args.command == "correct":
         correct(args.entity, args.new_fact, args.old, args.category, args.source)
         print(f"✨ Central Brain: Successfully corrected memory for [{args.category}] ({args.entity}) -> {args.new_fact}")
+
+    elif args.command == "graph":
+        print(f"🕸️ Extracting code knowledge graph for '{args.path}'...")
+        ok, msg = run_graphify(args.path, code_only=not args.deep)
+        print(msg)
+
+    elif args.command == "god-nodes":
+        res = get_god_nodes(args.path, args.top)
+        print(f"\n🏛️ ARCHITECTURAL GOD NODES (Most Connected):\n{res}\n")
+
+    elif args.command == "callers":
+        res = query_graph_connections(args.symbol, args.path)
+        print(f"\n{res}\n")
 
     elif args.command == "ingest":
         p = Path(args.path).resolve()
