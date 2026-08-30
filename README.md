@@ -26,9 +26,8 @@ The design of **Central Brain** combines the best concepts from leading open-sou
 | **[Cognee](https://github.com/topoteretes/cognee)** | **Graph RAG & Reranking**: Extracting entity relationships and combining structural facts with semantic document chunks. |
 | **[Zep / Graphiti](https://github.com/getzep/graphiti)** | **Temporal Event Tracking**: Daily episode logs preserve exact chronological history so agents can trace when decisions or fixes occurred. |
 | **[Obsidian Smart Connections](https://github.com/chillerlan/obsidian-smart-connections)** | **Human-Readable Markdown Core**: All knowledge stays in plain `.md` files without proprietary database lock-in. |
-| **[Ollama](https://github.com/ollama/ollama)** | **Local Vector Embeddings**: Using Ollama's local `mxbai-embed-large` model for 100% offline, privacy-preserving semantic search. |
-| **[SQLite FTS5](https://www.sqlite.org/fts5.html)** | **Hybrid Search**: Full-text keyword search fused with dense vector cosine similarity ($75\%$ Vector + $25\%$ Keyword). |
-| **[Graphify](https://github.com/Graphify-Labs/graphify)** | **Deterministic AST Knowledge Graphs**: Extracting code call-graphs, architectural god-nodes, and community clusters without embedding drift. |
+| **[Ollama](https://github.com/ollama/ollama)** | **Local Vector Embeddings**: Using Ollama's local `mxbai-embed-large` model via `/api/embed` batch API for 100% offline, privacy-preserving semantic search. |
+| **[SQLite FTS5](https://www.sqlite.org/fts5.html)** | **Hybrid Search**: Full-text keyword search fused with dense vector cosine similarity and exponential temporal decay ($70\%$ Vector + $30\%$ Keyword + Recency Boost). |
 
 ---
 
@@ -39,9 +38,10 @@ The design of **Central Brain** combines the best concepts from leading open-sou
 ├── knowledge/         # Technical architecture, system rules, hardware guides
 ├── projects/          # Codebase project maps, design specs, module indexes
 ├── episodes/          # Auto-generated daily work logs (YYYY-MM-DD.md)
+├── backups/           # Point-in-time compressed snapshots (brain backup)
 ├── db/
 │   └── brain.db       # Local SQLite Vector & FTS5 Database (WAL mode enabled)
-├── facts.json         # Structured entity-fact graph
+├── facts.json         # Structured entity-fact graph (auto-synced)
 ├── sources.json       # Central registry for auto-synced local directories
 └── brain.py           # Core Central Brain Engine & MCP Server
 ```
@@ -69,7 +69,10 @@ brain status
 ### 1. Command Line Interface (`brain`)
 ```bash
 # Query the brain across all past projects & fixes
-brain query "how to fix bluetooth on arch"
+brain query "bluetooth autosuspend"
+
+# Precision filtered query (category, entity, JSON output)
+brain query "bluetooth" -c "Fix" -e "Realtek RTL8852BE Bluetooth" --json
 
 # Remember a new decision or fix across sessions
 brain remember "Realtek Wi-Fi power save set to 2" --entity "Wi-Fi" --category "Fix"
@@ -80,14 +83,14 @@ brain correct "Wi-Fi" "Realtek Wi-Fi fix is setting rtw89 aspm disabled" --categ
 # Erase an invalid, false, or obsolete memory completely
 brain forget "temporary false assumption" --entity "Wi-Fi"
 
-# Extract deterministic AST code knowledge graph for a project (Graphify)
-brain graph /path/to/project/
+# Export a compiled Markdown memory digest or JSON state
+brain export ~/MEMORY.md -d 7
 
-# Identify architectural hubs & most connected symbols (God Nodes)
-brain god-nodes /path/to/project/
+# Create a transactional point-in-time snapshot backup
+brain backup
 
-# Find incoming callers and outgoing dependencies for any symbol
-brain callers "ingest_file" /path/to/project/
+# Restore Central Brain from a backup archive
+brain restore ~/.central_brain/backups/brain_backup_YYYYMMDD_HHMMSS.tar.gz
 
 # Ingest a new Markdown document or project folder
 brain ingest /path/to/project/
@@ -99,7 +102,7 @@ brain sync
 brain prune
 
 # View database health & stats
-brain status
+brain status --json
 
 # Launch stdio MCP server for agent tool calls
 brain mcp

@@ -26,13 +26,14 @@ The `brain` tool is NOT an LLM function/tool call. It is an executable CLI binar
      `brain prune`
      (Purges orphan files deleted from disk, deduplicates facts, and vacuums SQLite storage).
 
-5. **CODEBASE KNOWLEDGE GRAPH & CALLERS (BASH)**:
-   - To extract an AST call-graph and architectural hubs for any project codebase, execute:
-     `brain graph <project_path>`
-   - To inspect the most connected architectural components (god-nodes), execute:
-     `brain god-nodes <project_path>`
-   - To find who calls/depends on a specific function or class, execute:
-     `brain callers "<symbol>" <project_path>`
+5. **BACKUP, EXPORT & PRECISION FILTERING (BASH)**:
+   - For structured JSON output in scripts/agents, pass `--json` to any command (e.g. `brain query "<query>" --json`).
+   - To filter search by category or entity, use:
+     `brain query "<query>" -c "<Fix|Rule|Knowledge>" -e "<Entity>"`
+   - To export a compiled markdown memory digest, execute:
+     `brain export [output_file.md]`
+   - To create a full point-in-time snapshot, execute:
+     `brain backup [path.tar.gz]`
 
 6. **EMPIRICAL ANSWERS**:
-   - Base technical decisions on actual outputs returned from `brain query`, `brain callers`, and terminal commands.
+   - Base technical decisions on actual outputs returned from `brain query` and terminal commands.

@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """
 Central Brain - Unified Local Memory Engine for Multi-Platform AI Agents
-Integrates Markdown vault, Ollama vector embeddings (mxbai-embed-large),
-SQLite FTS5 keyword search, structured facts graph, and MCP tool interface.
+Features:
+  - Fast batch embeddings via Ollama /api/embed (with safe truncation & retry)
+  - Code-fence-safe hierarchical Markdown chunking with breadcrumbs
+  - Recency-weighted hybrid search (Dense Vectors + SQLite FTS5 BM25 + Exponential Decay)
+  - Multi-field precision filtering (by entity, category, source, time range, file path)
+  - Automated transactional SQLite & vault backups (brain backup / restore)
+  - Compiled memory digest export (brain export)
+  - Universal JSON output mode (--json) for seamless agent scriptability
+  - JSON-RPC 2.0 stdio MCP Server (brain mcp)
 """
 
 import sys
@@ -12,9 +19,13 @@ import json
 import hashlib
 import time
 import math
+import struct
+import tarfile
+import shutil
 import argparse
 import urllib.request
 import urllib.error
+import re
 from pathlib import Path
 from datetime import datetime
 
@@ -26,12 +37,14 @@ EPISODES_DIR = BRAIN_DIR / "episodes"
 DB_DIR = BRAIN_DIR / "db"
 DB_PATH = DB_DIR / "brain.db"
 FACTS_PATH = BRAIN_DIR / "facts.json"
+BACKUP_DIR = BRAIN_DIR / "backups"
 
-OLLAMA_URL = "http://localhost:11434/api/embeddings"
+OLLAMA_EMBED_URL = "http://localhost:11434/api/embed"
 DEFAULT_EMBED_MODEL = "mxbai-embed-large"
+EMBED_BATCH_SIZE = 32
 
 def ensure_dirs():
-    for d in [BRAIN_DIR, KNOWLEDGE_DIR, PROJECTS_DIR, EPISODES_DIR, DB_DIR]:
+    for d in [BRAIN_DIR, KNOWLEDGE_DIR, PROJECTS_DIR, EPISODES_DIR, DB_DIR, BACKUP_DIR]:
         d.mkdir(parents=True, exist_ok=True)
     if not FACTS_PATH.exists():
         with open(FACTS_PATH, "w", encoding="utf-8") as f:
@@ -43,7 +56,7 @@ def get_db():
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA busy_timeout=10000;")
-    # Initialize tables
+    conn.execute("PRAGMA synchronous=NORMAL;")
     with conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS chunks (
@@ -56,13 +69,12 @@ def get_db():
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # FTS table for keyword search
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_file_path ON chunks(file_path);")
         conn.execute("""
             CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
                 file_path, header, content, content='chunks', content_rowid='id'
             )
         """)
-        # Triggers to keep FTS table in sync
         conn.execute("""
             CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
                 INSERT INTO chunks_fts(rowid, file_path, header, content)
@@ -93,28 +105,63 @@ def get_db():
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_facts_entity_cat ON facts(entity, category, timestamp);")
     return conn
 
-def get_embedding(text: str, model: str = DEFAULT_EMBED_MODEL, max_retries: int = 3):
-    text_sample = text[:1500] if text else ""
+def encode_vector_blob(vec: list[float]) -> bytes:
+    """Packs float vector into compact binary IEEE 754 float32 blob."""
+    if not vec:
+        return b""
+    return struct.pack(f"{len(vec)}f", *vec)
+
+def decode_vector_blob(blob: bytes) -> list[float]:
+    """Unpacks binary blob into float vector (supports backward-compatibility with JSON strings)."""
+    if not blob:
+        return []
+    if isinstance(blob, str):
+        try:
+            return json.loads(blob)
+        except Exception:
+            return []
+    if len(blob) % 4 == 0 and not (blob.startswith(b'[') or blob.startswith(b'{')):
+        count = len(blob) // 4
+        return list(struct.unpack(f"{count}f", blob))
+    try:
+        return json.loads(blob.decode('utf-8'))
+    except Exception:
+        return []
+
+def get_embeddings_batch(texts: list[str], model: str = DEFAULT_EMBED_MODEL, max_retries: int = 3) -> list[list[float] | None]:
+    """High-performance batch embedding via Ollama /api/embed endpoint with automatic truncation."""
+    if not texts:
+        return []
+    cleaned_texts = [t.strip() if t and t.strip() else " " for t in texts]
+
     for attempt in range(max_retries):
         try:
             req = urllib.request.Request(
-                OLLAMA_URL,
-                data=json.dumps({"model": model, "prompt": text_sample}).encode("utf-8"),
+                OLLAMA_EMBED_URL,
+                data=json.dumps({"model": model, "input": cleaned_texts, "truncate": True}).encode("utf-8"),
                 headers={"Content-Type": "application/json"}
             )
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with urllib.request.urlopen(req, timeout=30) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-                emb = data.get("embedding")
-                if emb:
-                    return emb
+                embeddings = data.get("embeddings")
+                if embeddings and len(embeddings) == len(texts):
+                    return embeddings
         except Exception as e:
             if attempt < max_retries - 1:
                 time.sleep(0.2 * (attempt + 1))
             else:
-                print(f"[Brain Warning] Ollama embedding failed ({e}). Falling back to keyword search.", file=sys.stderr)
-    return None
+                print(f"[Brain Warning] Ollama batch embedding failed ({e}). Falling back to keyword search.", file=sys.stderr)
+    return [None] * len(texts)
+
+def get_embedding(text: str, model: str = DEFAULT_EMBED_MODEL) -> list[float] | None:
+    """Fetches single text embedding via batch endpoint."""
+    if not text or not text.strip():
+        return None
+    res = get_embeddings_batch([text], model=model)
+    return res[0] if res else None
 
 def cosine_similarity(v1, v2):
     if not v1 or not v2 or len(v1) != len(v2):
@@ -124,33 +171,110 @@ def cosine_similarity(v1, v2):
     norm2 = math.sqrt(sum(b * b for b in v2))
     return dot / (norm1 * norm2) if norm1 and norm2 else 0.0
 
-def chunk_markdown(content: str, file_path: str):
-    """Splits markdown content into logical header sections or chunks."""
-    lines = content.splitlines()
+def split_oversized_text(text: str, max_chars: int, overlap_chars: int) -> list[str]:
+    paragraphs = text.split("\n\n")
     chunks = []
-    current_header = "Header / General"
+    current_para = []
+    current_len = 0
+
+    for p in paragraphs:
+        p_len = len(p)
+        if current_len + p_len + 2 > max_chars and current_para:
+            chunk_body = "\n\n".join(current_para).strip()
+            chunks.append(chunk_body)
+            overlap_prefix = chunk_body[-overlap_chars:].strip() if len(chunk_body) > overlap_chars else ""
+            current_para = [overlap_prefix, p] if overlap_prefix else [p]
+            current_len = sum(len(x) + 2 for x in current_para)
+        else:
+            current_para.append(p)
+            current_len += p_len + 2
+
+    if current_para:
+        chunk_body = "\n\n".join(current_para).strip()
+        if chunk_body and (not chunks or chunk_body != chunks[-1]):
+            chunks.append(chunk_body)
+
+    return chunks if chunks else [text[:max_chars]]
+
+def chunk_markdown(content: str, file_path: str, max_chunk_chars: int = 2400, overlap_chars: int = 200) -> list[tuple[str, str]]:
+    """
+    Advanced semantic Markdown chunker:
+    - Protects code blocks from false '#' header splits.
+    - Preserves hierarchical breadcrumbs ('Architecture > Database > WAL').
+    - Recursively splits oversized sections at paragraph/list boundaries with overlap.
+    - Filters trivial stubs and merges header contexts.
+    """
+    if not content or not content.strip():
+        return []
+
+    lines = content.splitlines()
+    header_stack = {}
+    sections = []
     current_lines = []
+    in_code_block = False
+    fence_char = None
+
+    def get_current_breadcrumb():
+        if not header_stack:
+            return Path(file_path).name if file_path else "General"
+        levels = sorted(header_stack.keys())
+        return " > ".join(header_stack[lvl] for lvl in levels if header_stack[lvl])
 
     for line in lines:
-        if line.startswith("#"):
-            if current_lines:
-                chunk_text = "\n".join(current_lines).strip()
-                if chunk_text:
-                    chunks.append((current_header, chunk_text))
+        stripped = line.strip()
+
+        # Track fenced code block state
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            fence = stripped[:3]
+            if not in_code_block:
+                in_code_block = True
+                fence_char = fence
+            elif fence == fence_char:
+                in_code_block = False
+                fence_char = None
+            current_lines.append(line)
+            continue
+
+        if in_code_block:
+            current_lines.append(line)
+            continue
+
+        # Detect markdown heading outside code blocks
+        if stripped.startswith("#") and len(stripped) > 1:
+            header_level = len(stripped) - len(stripped.lstrip("#"))
+            if 1 <= header_level <= 6 and (len(stripped) == header_level or stripped[header_level] == " "):
+                non_empty_content = "\n".join(current_lines).strip()
+                if non_empty_content:
+                    sections.append((get_current_breadcrumb(), non_empty_content))
                 current_lines = []
-            current_header = line.lstrip("#").strip()
+
+                header_title = stripped[header_level:].strip()
+                header_stack = {lvl: txt for lvl, txt in header_stack.items() if lvl < header_level}
+                header_stack[header_level] = header_title
+                continue
+
         current_lines.append(line)
 
-    if current_lines:
-        chunk_text = "\n".join(current_lines).strip()
-        if chunk_text:
-            chunks.append((current_header, chunk_text))
+    non_empty_content = "\n".join(current_lines).strip()
+    if non_empty_content:
+        sections.append((get_current_breadcrumb(), non_empty_content))
 
-    return chunks
+    final_chunks = []
+    for breadcrumb, sec_text in sections:
+        if len(sec_text) <= max_chunk_chars:
+            if len(sec_text) > 15:
+                final_chunks.append((breadcrumb, sec_text))
+        else:
+            sub_chunks = split_oversized_text(sec_text, max_chunk_chars, overlap_chars)
+            for idx, sub_text in enumerate(sub_chunks, 1):
+                sub_header = f"{breadcrumb} (Part {idx})" if len(sub_chunks) > 1 else breadcrumb
+                final_chunks.append((sub_header, sub_text))
+
+    return final_chunks
 
 def ingest_file(file_path: Path):
     file_path = file_path.resolve()
-    if not file_path.exists() or file_path.suffix.lower() not in ['.md', '.txt', '.json']:
+    if not file_path.exists() or file_path.suffix.lower() not in ['.md', '.txt', '.json', '.conf', '.sh']:
         return 0
 
     try:
@@ -163,27 +287,32 @@ def ingest_file(file_path: Path):
     str_path = str(file_path)
     file_content_hash = hashlib.sha256(content.encode('utf-8')).hexdigest()
 
-    # Incremental check: if file content hasn't changed, skip re-embedding
     existing = conn.execute("SELECT COUNT(*), hash FROM chunks WHERE file_path = ?", (str_path,)).fetchall()
     if existing and existing[0][0] > 0:
         first_hash = existing[0][1] or ""
         if first_hash.startswith(f"{file_content_hash}:"):
-            return existing[0][0] # No changes detected, return existing chunk count
+            return existing[0][0]
 
     chunks = chunk_markdown(content, str_path)
+    if not chunks:
+        return 0
+
+    # Batch embedding calculation
+    prepared_inputs = [f"{header}\n{text}" for header, text in chunks]
+    all_vectors = []
+    for i in range(0, len(prepared_inputs), EMBED_BATCH_SIZE):
+        batch = prepared_inputs[i:i + EMBED_BATCH_SIZE]
+        vecs = get_embeddings_batch(batch)
+        all_vectors.extend(vecs)
+
     ingested_count = 0
-
     with conn:
-        # Atomic replacement: Delete old chunks for this file (FTS triggers auto-delete from FTS index)
         conn.execute("DELETE FROM chunks WHERE file_path = ?", (str_path,))
-
-        for idx, (header, chunk_text) in enumerate(chunks):
+        for idx, ((header, chunk_text), vec) in enumerate(zip(chunks, all_vectors)):
             chunk_hash = f"{file_content_hash}:{idx}:{hashlib.sha256(chunk_text.encode('utf-8')).hexdigest()[:16]}"
-            vec = get_embedding(f"{header}\n{chunk_text}")
-            vec_blob = json.dumps(vec) if vec else None
-
+            vec_blob = encode_vector_blob(vec) if vec else None
             conn.execute(
-                "INSERT INTO chunks (file_path, header, content, embedding, hash) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO chunks (file_path, header, content, embedding, hash, updated_at) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                 (str_path, header, chunk_text, vec_blob, chunk_hash)
             )
             ingested_count += 1
@@ -195,82 +324,31 @@ def ingest_directory(dir_path: Path):
     dir_path = dir_path.resolve()
     for root, _, files in os.walk(dir_path):
         for file in files:
-            if file.endswith('.md') or file.endswith('.txt'):
+            if file.endswith(('.md', '.txt', '.conf', '.sh')):
                 fp = Path(root) / file
                 total += ingest_file(fp)
     return total
 
-def search_brain(query: str, top_k: int = 5):
+def sync_facts_json():
+    """Syncs the SQLite facts table into ~/.central_brain/facts.json for version control tracking."""
     conn = get_db()
-    query_vec = get_embedding(query)
+    rows = conn.execute("SELECT id, entity, category, fact, source, timestamp FROM facts ORDER BY id ASC").fetchall()
+    facts_list = [dict(r) for r in rows]
+    with open(FACTS_PATH, "w", encoding="utf-8") as f:
+        json.dump(facts_list, f, indent=2)
 
-    # 1. Vector Search
-    vector_results = []
-    if query_vec:
-        rows = conn.execute("SELECT id, file_path, header, content, embedding FROM chunks WHERE embedding IS NOT NULL").fetchall()
-        for r in rows:
-            vec = json.loads(r['embedding'])
-            sim = cosine_similarity(query_vec, vec)
-            vector_results.append((sim, dict(r)))
-        vector_results.sort(key=lambda x: x[0], reverse=True)
-
-    # 2. FTS Keyword Search
-    fts_results = {}
-    try:
-        # Sanitize query for FTS
-        clean_q = "".join([c if c.isalnum() or c.isspace() else " " for c in query]).strip()
-        if clean_q:
-            fts_rows = conn.execute("""
-                SELECT rowid as id, file_path, header, content, rank
-                FROM chunks_fts WHERE chunks_fts MATCH ? ORDER BY rank LIMIT 10
-            """, (clean_q,)).fetchall()
-            for rank_idx, r in enumerate(fts_rows):
-                # Normalized keyword score
-                fts_results[r['id']] = 1.0 / (rank_idx + 1)
-    except Exception as e:
-        pass
-
-    # 3. Hybrid Reranking
-    hybrid_scores = {}
-    doc_map = {}
-
-    for sim, doc in vector_results[:20]:
-        doc_id = doc['id']
-        doc_map[doc_id] = doc
-        hybrid_scores[doc_id] = hybrid_scores.get(doc_id, 0.0) + (0.75 * sim)
-
-    for doc_id, kw_score in fts_results.items():
-        if doc_id not in doc_map:
-            r = conn.execute("SELECT id, file_path, header, content FROM chunks WHERE id = ?", (doc_id,)).fetchone()
-            if r:
-                doc_map[doc_id] = dict(r)
-        hybrid_scores[doc_id] = hybrid_scores.get(doc_id, 0.0) + (0.25 * kw_score)
-
-    sorted_docs = sorted(hybrid_scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
-
-    # 4. Also retrieve matching facts
-    facts_rows = conn.execute(
-        "SELECT entity, category, fact, source, timestamp FROM facts WHERE fact LIKE ? OR entity LIKE ? ORDER BY id DESC LIMIT 5",
-        (f"%{query}%", f"%{query}%")
-    ).fetchall()
-
-    return {
-        "chunks": [{"score": round(score, 4), **doc_map[doc_id]} for doc_id, score in sorted_docs],
-        "facts": [dict(f) for f in facts_rows]
-    }
-
-def remember(fact: str, entity: str = "General", category: str = "Knowledge", source: str = "Agent"):
+def remember(fact: str, entity: str = "General", category: str = "Knowledge", source: str = "CLI"):
+    """Saves a structured fact to SQLite, syncs facts.json, and appends to today's episode file."""
     conn = get_db()
     with conn:
         conn.execute(
             "INSERT INTO facts (entity, category, fact, source) VALUES (?, ?, ?, ?)",
             (entity, category, fact, source)
         )
+    sync_facts_json()
 
-    # Append to today's episode file
     today_str = datetime.now().strftime("%Y-%m-%d")
     today_file = EPISODES_DIR / f"{today_str}.md"
-
     mode = "a" if today_file.exists() else "w"
     with open(today_file, mode, encoding="utf-8") as f:
         if mode == "w":
@@ -278,12 +356,11 @@ def remember(fact: str, entity: str = "General", category: str = "Knowledge", so
         time_str = datetime.now().strftime("%H:%M:%S")
         f.write(f"- [{time_str}] **[{category}]** ({entity}): {fact} (via {source})\n")
 
-    # Ingest today's episode file to vector DB
     ingest_file(today_file)
     return True
 
 def forget(target: str, entity: str = None):
-    """Deletes matching facts and records an invalidation log in today's episode file."""
+    """Deletes matching facts, syncs facts.json, and records an invalidation log in today's episode file."""
     conn = get_db()
     deleted_count = 0
     with conn:
@@ -294,7 +371,8 @@ def forget(target: str, entity: str = None):
             cur = conn.execute("DELETE FROM facts WHERE fact LIKE ? OR entity LIKE ?", (f"%{target}%", f"%{target}%"))
             deleted_count = cur.rowcount
 
-    # Append invalidation log to today's episode file
+    sync_facts_json()
+
     today_str = datetime.now().strftime("%Y-%m-%d")
     today_file = EPISODES_DIR / f"{today_str}.md"
     mode = "a" if today_file.exists() else "w"
@@ -308,7 +386,7 @@ def forget(target: str, entity: str = None):
     ingest_file(today_file)
     return deleted_count
 
-def correct(entity: str, new_fact: str, old_fact_search: str = None, category: str = "Fix", source: str = "Agent"):
+def correct(entity: str, new_fact: str, old_fact_search: str = None, category: str = "Fix", source: str = "CLI"):
     """Corrects/supersedes an existing memory with a new finding."""
     conn = get_db()
     with conn:
@@ -322,7 +400,8 @@ def correct(entity: str, new_fact: str, old_fact_search: str = None, category: s
             (entity, category, new_fact, source)
         )
 
-    # Append correction log to today's episode file
+    sync_facts_json()
+
     today_str = datetime.now().strftime("%Y-%m-%d")
     today_file = EPISODES_DIR / f"{today_str}.md"
     mode = "a" if today_file.exists() else "w"
@@ -335,108 +414,392 @@ def correct(entity: str, new_fact: str, old_fact_search: str = None, category: s
     ingest_file(today_file)
     return True
 
-def run_graphify(target_path: Path = None, code_only: bool = True, backend: str = "ollama"):
-    """Extracts a deterministic AST code knowledge graph using Graphify and indexes it into the Central Brain."""
-    import subprocess
-    target = Path(target_path).resolve() if target_path else Path.cwd()
-    if not target.exists():
-        return False, f"Target path {target} does not exist."
+def calculate_recency_and_category_boost(doc: dict) -> float:
+    """Calculates temporal recency decay and category multipliers."""
+    boost = 1.0
+    now = datetime.now()
+    fp = doc.get("file_path", "")
+    content = doc.get("content", "")
+    header = doc.get("header", "")
 
-    cmd = ["graphify", "extract", str(target)]
-    if code_only:
-        cmd.append("--code-only")
+    doc_date = None
+    date_match = re.search(r"(\d{4}-\d{2}-\d{2})", fp)
+    if date_match:
+        try:
+            doc_date = datetime.strptime(date_match.group(1), "%Y-%m-%d")
+        except Exception:
+            pass
+
+    if not doc_date and doc.get("updated_at"):
+        try:
+            doc_date = datetime.strptime(str(doc["updated_at"]).split(".")[0], "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+
+    if doc_date:
+        age_days = max(0.0, (now - doc_date).total_seconds() / 86400.0)
+        recency_factor = 0.30 * math.exp(- (math.log(2) / 14.0) * age_days)
+        boost += recency_factor
+
+    if "[Fix]" in content or "Fix" in header or "Fix" in fp:
+        boost *= 1.20
+    elif "[Rule]" in content or "project_map" in fp:
+        boost *= 1.15
+
+    return boost
+
+def search_brain(query: str, top_k: int = 5, entity: str = None, category: str = None,
+                 source: str = None, since: str = None, until: str = None, path_filter: str = None):
+    """
+    Recency-weighted Hybrid Search across Vectors, FTS5 Keywords, and Structured Facts.
+    Supports multi-field precision filtering.
+    """
+    conn = get_db()
+    query_vec = get_embedding(query) if query else None
+
+    # 1. Dense Vector Search
+    vector_results = []
+    if query_vec:
+        sql = "SELECT id, file_path, header, content, embedding, updated_at FROM chunks WHERE embedding IS NOT NULL"
+        params = []
+        if path_filter:
+            sql += " AND file_path LIKE ?"
+            params.append(f"%{path_filter}%")
+        rows = conn.execute(sql, params).fetchall()
+        for r in rows:
+            vec = decode_vector_blob(r['embedding'])
+            sim = cosine_similarity(query_vec, vec)
+            vector_results.append((sim, dict(r)))
+        vector_results.sort(key=lambda x: x[0], reverse=True)
+
+    # 2. FTS5 Keyword Search
+    fts_results = {}
+    if query:
+        try:
+            clean_q = "".join([c if c.isalnum() or c.isspace() else " " for c in query]).strip()
+            if clean_q:
+                sql = "SELECT rowid as id, file_path, header, content, rank, updated_at FROM chunks_fts WHERE chunks_fts MATCH ?"
+                params = [clean_q]
+                if path_filter:
+                    sql += " AND file_path LIKE ?"
+                    params.append(f"%{path_filter}%")
+                sql += " ORDER BY rank LIMIT 25"
+                fts_rows = conn.execute(sql, params).fetchall()
+                for rank_idx, r in enumerate(fts_rows):
+                    fts_results[r['id']] = 1.0 / (rank_idx + 1)
+        except Exception:
+            pass
+
+    # 3. Recency-Weighted Hybrid Scoring
+    hybrid_scores = {}
+    doc_map = {}
+
+    for sim, doc in vector_results[:40]:
+        doc_id = doc['id']
+        doc_map[doc_id] = doc
+        hybrid_scores[doc_id] = hybrid_scores.get(doc_id, 0.0) + (0.70 * sim)
+
+    for doc_id, kw_score in fts_results.items():
+        if doc_id not in doc_map:
+            r = conn.execute("SELECT id, file_path, header, content, updated_at FROM chunks WHERE id = ?", (doc_id,)).fetchone()
+            if r:
+                doc_map[doc_id] = dict(r)
+        hybrid_scores[doc_id] = hybrid_scores.get(doc_id, 0.0) + (0.30 * kw_score)
+
+    final_ranked = []
+    for doc_id, base_score in hybrid_scores.items():
+        if doc_id in doc_map:
+            doc = doc_map[doc_id]
+            multiplier = calculate_recency_and_category_boost(doc)
+            final_score = base_score * multiplier
+            final_ranked.append((final_score, doc))
+
+    final_ranked.sort(key=lambda x: x[0], reverse=True)
+    top_docs = final_ranked[:top_k]
+
+    # 4. Structured Facts Search with Precision Filtering
+    fact_conditions = []
+    fact_params = []
+    if query:
+        fact_conditions.append("(fact LIKE ? OR entity LIKE ?)")
+        fact_params.extend([f"%{query}%", f"%{query}%"])
+    if entity:
+        fact_conditions.append("entity = ? COLLATE NOCASE")
+        fact_params.append(entity)
+    if category:
+        fact_conditions.append("category = ? COLLATE NOCASE")
+        fact_params.append(category)
+    if source:
+        fact_conditions.append("source = ? COLLATE NOCASE")
+        fact_params.append(source)
+    if since:
+        fact_conditions.append("timestamp >= ?")
+        fact_params.append(since)
+    if until:
+        fact_conditions.append("timestamp <= ?")
+        fact_params.append(until)
+
+    where_sql = " AND ".join(fact_conditions) if fact_conditions else "1=1"
+    facts_rows = conn.execute(
+        f"SELECT id, entity, category, fact, source, timestamp FROM facts WHERE {where_sql} ORDER BY id DESC LIMIT ?",
+        (*fact_params, top_k)
+    ).fetchall()
+
+    return {
+        "chunks": [{"score": round(score, 4), **{k: v for k, v in doc.items() if k != 'embedding'}} for score, doc in top_docs],
+        "facts": [dict(f) for f in facts_rows]
+    }
+
+def clean_orphans():
+    """Finds indexed files that no longer exist on disk and purges their chunks & FTS entries."""
+    conn = get_db()
+    indexed_files = [r[0] for r in conn.execute("SELECT DISTINCT file_path FROM chunks").fetchall()]
+    orphan_files = 0
+    orphan_chunks = 0
+
+    with conn:
+        for fp_str in indexed_files:
+            p = Path(fp_str)
+            if not p.exists():
+                count = conn.execute("SELECT COUNT(*) FROM chunks WHERE file_path = ?", (fp_str,)).fetchone()[0]
+                conn.execute("DELETE FROM chunks WHERE file_path = ?", (fp_str,))
+                orphan_files += 1
+                orphan_chunks += count
+
+    return orphan_files, orphan_chunks
+
+def prune_brain():
+    """Cleans orphan files, deduplicates facts, and vacuums the SQLite database."""
+    orphans_files, orphan_chunks = clean_orphans()
+    conn = get_db()
+
+    with conn:
+        conn.execute("""
+            DELETE FROM facts WHERE id NOT IN (
+                SELECT MAX(id) FROM facts GROUP BY entity, category, fact
+            )
+        """)
+
+    sync_facts_json()
+
+    # Reclaim disk space via VACUUM
+    prev_iso = conn.isolation_level
+    conn.isolation_level = None
+    conn.execute("VACUUM;")
+    conn.isolation_level = prev_iso
+
+    return orphans_files, orphan_chunks
+
+def backup_brain(output_path: Path = None, include_vault: bool = True) -> tuple[bool, str, dict]:
+    """Creates a transactional SQLite snapshot and packages the Central Brain vault."""
+    ensure_dirs()
+    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if not output_path:
+        output_path = BACKUP_DIR / f"brain_backup_{timestamp_str}.tar.gz"
     else:
-        cmd.extend(["--backend", backend])
+        output_path = Path(output_path).resolve()
+
+    sync_facts_json()
+    temp_snapshot_dir = BACKUP_DIR / f"temp_{timestamp_str}"
+    temp_snapshot_dir.mkdir(parents=True, exist_ok=True)
+    temp_db = temp_snapshot_dir / "brain.db"
 
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        out = proc.stdout + proc.stderr
-        graph_out = target / "graphify-out"
-        graph_json = graph_out / "graph.json"
+        # 1. Transactional SQLite online backup
+        src_conn = get_db()
+        dst_conn = sqlite3.connect(temp_db)
+        with dst_conn:
+            src_conn.backup(dst_conn, pages=250)
+        dst_conn.close()
 
-        indexed_chunks = 0
-        if graph_json.exists():
-            indexed_chunks = ingest_file(graph_json)
-            report_md = graph_out / "GRAPH_REPORT.md"
-            if report_md.exists():
-                indexed_chunks += ingest_file(report_md)
-        return True, f"Graphify extraction complete. Generated graph.json ({indexed_chunks} chunks indexed into Central Brain).\n{out.strip()}"
+        # 2. Collect vault assets
+        st = get_status()
+        manifest = {
+            "backup_version": "2.0",
+            "created_at": datetime.now().isoformat(),
+            "metrics": st,
+            "included_vault": include_vault
+        }
+        with open(temp_snapshot_dir / "manifest.json", "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+
+        if FACTS_PATH.exists():
+            shutil.copy2(FACTS_PATH, temp_snapshot_dir / "facts.json")
+        sources_file = BRAIN_DIR / "sources.json"
+        if sources_file.exists():
+            shutil.copy2(sources_file, temp_snapshot_dir / "sources.json")
+
+        if include_vault:
+            for vdir in ["knowledge", "projects", "episodes"]:
+                src_v = BRAIN_DIR / vdir
+                if src_v.exists():
+                    shutil.copytree(src_v, temp_snapshot_dir / vdir, dirs_exist_ok=True)
+
+        # 3. Create compressed tarball
+        with tarfile.open(output_path, "w:gz") as tar:
+            for item in temp_snapshot_dir.iterdir():
+                tar.add(item, arcname=item.name)
+
+        return True, f"Backup successfully created at {output_path}", manifest
     except Exception as e:
-        return False, f"Graphify execution failed: {e}"
+        return False, f"Backup failed: {e}", {}
+    finally:
+        shutil.rmtree(temp_snapshot_dir, ignore_errors=True)
 
-def get_god_nodes(target_path: Path = None, top_n: int = 10):
-    """Retrieves the most connected architectural hub nodes from graph.json."""
-    import subprocess
-    g_path = None
-    if target_path:
-        p = Path(target_path).resolve()
-        if (p / "graphify-out" / "graph.json").exists():
-            g_path = p / "graphify-out" / "graph.json"
-        elif p.name == "graph.json" and p.exists():
-            g_path = p
+def restore_brain(backup_path: Path, force: bool = False) -> tuple[bool, str]:
+    """Restores Central Brain database and vault from a backup archive."""
+    backup_path = Path(backup_path).resolve()
+    if not backup_path.exists():
+        return False, f"Backup file {backup_path} does not exist."
 
-    cmd = ["graphify", "god-nodes", "--top", str(top_n)]
-    if g_path:
-        cmd.extend(["--graph", str(g_path)])
+    # Create safety backup of current state
+    if not force:
+        safety_ok, safety_msg, _ = backup_brain(include_vault=True)
+        if not safety_ok:
+            return False, f"Could not create pre-restore safety snapshot: {safety_msg}"
+
+    extract_tmp = BACKUP_DIR / f"restore_tmp_{int(time.time())}"
+    extract_tmp.mkdir(parents=True, exist_ok=True)
 
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        return proc.stdout.strip()
+        with tarfile.open(backup_path, "r:gz") as tar:
+            tar.extractall(extract_tmp)
+
+        restored_db = extract_tmp / "brain.db"
+        if restored_db.exists():
+            chk_conn = sqlite3.connect(restored_db)
+            integ = chk_conn.execute("PRAGMA integrity_check;").fetchone()[0]
+            chk_conn.close()
+            if integ != "ok":
+                return False, f"Restored database failed integrity check: {integ}"
+
+            shutil.copy2(restored_db, DB_PATH)
+
+        if (extract_tmp / "facts.json").exists():
+            shutil.copy2(extract_tmp / "facts.json", FACTS_PATH)
+        if (extract_tmp / "sources.json").exists():
+            shutil.copy2(extract_tmp / "sources.json", BRAIN_DIR / "sources.json")
+
+        for vdir in ["knowledge", "projects", "episodes"]:
+            src_v = extract_tmp / vdir
+            if src_v.exists():
+                shutil.copytree(src_v, BRAIN_DIR / vdir, dirs_exist_ok=True)
+
+        return True, f"Central Brain restored successfully from {backup_path}"
     except Exception as e:
-        return f"Error querying god nodes: {e}"
+        return False, f"Restore failed: {e}"
+    finally:
+        shutil.rmtree(extract_tmp, ignore_errors=True)
 
-def query_graph_connections(symbol: str, target_path: Path = None):
-    """Finds callers, callees, and dependencies for a symbol from graph.json."""
-    g_path = None
-    if target_path:
-        p = Path(target_path).resolve()
-        g_path = (p / "graphify-out" / "graph.json") if (p / "graphify-out" / "graph.json").exists() else (p if p.name == "graph.json" else None)
+def export_brain(output_file: Path = None, fmt: str = "markdown", category: str = None, entity: str = None, days: int = 30) -> str:
+    """Compiles permanent rules, structured facts, and recent episodes into a single digest."""
+    conn = get_db()
+    facts_cond = []
+    params = []
+    if category:
+        facts_cond.append("category = ? COLLATE NOCASE")
+        params.append(category)
+    if entity:
+        facts_cond.append("entity = ? COLLATE NOCASE")
+        params.append(entity)
 
-    if not g_path or not g_path.exists():
-        matches = list(Path.home().glob("**/graphify-out/graph.json"))
-        if matches:
-            g_path = matches[0]
+    where_clause = " WHERE " + " AND ".join(facts_cond) if facts_cond else ""
+    facts_rows = conn.execute(f"SELECT entity, category, fact, source, timestamp FROM facts{where_clause} ORDER BY category, entity", params).fetchall()
+
+    if fmt == "json":
+        data = {
+            "generated_at": datetime.now().isoformat(),
+            "facts": [dict(r) for r in facts_rows],
+            "status": get_status()
+        }
+        out_str = json.dumps(data, indent=2)
+    else:
+        lines = [
+            "# 🧠 Central Brain — Compiled Knowledge & System Memory Digest",
+            f"*Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*\n",
+            "## 📌 Permanent Rules & System Fixes"
+        ]
+
+        fixes = [r for r in facts_rows if r['category'] in ['Fix', 'Rule']]
+        other_facts = [r for r in facts_rows if r['category'] not in ['Fix', 'Rule']]
+
+        if fixes:
+            for f in fixes:
+                lines.append(f"- **[{f['category']}]** ({f['entity']}): {f['fact']}")
         else:
-            return f"No graph.json found. Run 'brain graph <project_path>' first."
+            lines.append("*(No permanent rules/fixes registered yet)*")
 
-    try:
-        with open(g_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        lines.append("\n## 📚 Entity Knowledge & Findings")
+        if other_facts:
+            current_ent = None
+            for f in other_facts:
+                if f['entity'] != current_ent:
+                    current_ent = f['entity']
+                    lines.append(f"\n### {current_ent}")
+                lines.append(f"- [{f['category']}] {f['fact']} *(via {f['source']}, {f['timestamp'].split()[0]})*")
+        else:
+            lines.append("*(No additional entity facts registered)*")
 
-        nodes = {n["id"]: n.get("label", n["id"]) for n in data.get("nodes", [])}
-        clean_sym = symbol.strip().lower().replace("()", "")
-        callers = []
-        callees = []
+        lines.append(f"\n## 🕒 Recent Episode History (Last {days} Days)")
+        ep_files = sorted(list(EPISODES_DIR.glob("*.md")), reverse=True)[:days]
+        if ep_files:
+            for ep in ep_files:
+                ep_text = ep.read_text(encoding='utf-8', errors='ignore').strip()
+                lines.append(f"\n### Episode: {ep.stem}")
+                for ep_line in ep_text.splitlines():
+                    if ep_line.startswith("- ["):
+                        lines.append(f"  {ep_line}")
+        else:
+            lines.append("*(No recent episode logs)*")
 
-        links = data.get("links", data.get("edges", []))
-        for e in links:
-            src_id = str(e.get("source", "")).lower()
-            tgt_id = str(e.get("target", "")).lower()
-            src_name = nodes.get(e.get("source"), e.get("source"))
-            tgt_name = nodes.get(e.get("target"), e.get("target"))
-            rel = e.get("relation", "calls")
-            loc = f" ({e.get('source_file','')}:{e.get('source_location','')})" if e.get('source_file') else ""
+        out_str = "\n".join(lines) + "\n"
 
-            if clean_sym in tgt_id or clean_sym in str(tgt_name).lower():
-                callers.append(f"{src_name} --[{rel}]--> {tgt_name}{loc}")
-            elif clean_sym in src_id or clean_sym in str(src_name).lower():
-                callees.append(f"{src_name} --[{rel}]--> {tgt_name}{loc}")
+    if output_file:
+        output_file = Path(output_file).resolve()
+        output_file.write_text(out_str, encoding="utf-8")
 
-        res = [f"📊 GRAPH CONNECTIONS FOR '{symbol}' (from {g_path.parent.parent.name}):"]
-        if callers:
-            res.append("\nIncoming Calls / Usages (Who calls/uses this):")
-            for c in callers[:15]:
-                res.append(f"  • {c}")
-        if callees:
-            res.append("\nOutgoing Calls / Dependencies (What this calls):")
-            for c in callees[:15]:
-                res.append(f"  • {c}")
-        if not callers and not callees:
-            res.append(f"No direct edges found for '{symbol}'.")
+    return out_str
 
-        return "\n".join(res)
-    except Exception as e:
-        return f"Error reading graph connections: {e}"
+def sync_brain():
+    """Scans all registered directories/files and updates modified content in vector DB."""
+    sources_file = BRAIN_DIR / "sources.json"
+    default_sources = [
+        str(KNOWLEDGE_DIR),
+        str(PROJECTS_DIR),
+        str(EPISODES_DIR),
+        str(Path.home() / "Documents" / "Configs"),
+        str(Path.home() / ".agents" / "project_map.md"),
+        str(Path.home() / "AGENTS.md")
+    ]
+
+    if not sources_file.exists():
+        with open(sources_file, "w", encoding="utf-8") as f:
+            json.dump(default_sources, f, indent=2)
+        sources = default_sources
+    else:
+        try:
+            with open(sources_file, "r", encoding="utf-8") as f:
+                sources = json.load(f)
+        except Exception:
+            sources = default_sources
+
+    total_chunks = 0
+    synced_paths = 0
+    for src in sources:
+        p = Path(src)
+        if p.is_file():
+            cnt = ingest_file(p)
+            total_chunks += cnt
+            synced_paths += 1
+        elif p.is_dir():
+            cnt = ingest_directory(p)
+            total_chunks += cnt
+            synced_paths += 1
+
+    orphan_files, orphan_chunks = clean_orphans()
+    sync_facts_json()
+
+    return synced_paths, total_chunks, orphan_files, orphan_chunks
 
 def get_status():
     conn = get_db()
@@ -444,7 +807,6 @@ def get_status():
     total_files = conn.execute("SELECT COUNT(DISTINCT file_path) FROM chunks").fetchone()[0]
     total_facts = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
 
-    # Test Ollama
     ollama_ok = False
     try:
         vec = get_embedding("test")
@@ -453,27 +815,30 @@ def get_status():
     except Exception:
         pass
 
+    db_size = DB_PATH.stat().st_size if DB_PATH.exists() else 0
     return {
         "brain_directory": str(BRAIN_DIR),
         "total_indexed_files": total_files,
         "total_chunks": total_chunks,
         "total_facts": total_facts,
-        "ollama_embedding_status": "Connected (mxbai-embed-large)" if ollama_ok else "Unavailable / Fallback to FTS",
-        "database_size_bytes": DB_PATH.stat().st_size if DB_PATH.exists() else 0
+        "ollama_embedding_status": f"Connected ({DEFAULT_EMBED_MODEL} via /api/embed)" if ollama_ok else "Unavailable / Fallback to FTS",
+        "database_size_bytes": db_size,
+        "database_size_mb": round(db_size / (1024 * 1024), 2)
     }
 
-# MCP Server Implementation for Antigravity & Agent Protocols
 def run_mcp_server():
     """Runs a standard Model Context Protocol (MCP) JSON-RPC stdio server."""
-    sys.stderr.write("Starting Central Brain MCP Server...\n")
+    sys.stderr.write("Starting Central Brain MCP Server (stdio)...\n")
+    sys.stderr.flush()
+
     while True:
         try:
             line = sys.stdin.readline()
             if not line:
                 break
             req = json.loads(line.strip())
-            req_id = req.get("id")
             method = req.get("method")
+            req_id = req.get("id")
 
             if method == "initialize":
                 resp = {
@@ -482,7 +847,7 @@ def run_mcp_server():
                     "result": {
                         "protocolVersion": "2024-11-05",
                         "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "central-brain-mcp", "version": "1.0.0"}
+                        "serverInfo": {"name": "central-brain", "version": "2.0.0"}
                     }
                 }
             elif method == "tools/list":
@@ -493,12 +858,14 @@ def run_mcp_server():
                         "tools": [
                             {
                                 "name": "brain_query",
-                                "description": "Search the local Central Brain across all project knowledge, architecture notes, and past agent facts.",
+                                "description": "Search Central Brain across all projects, configurations, and past learned solutions using recency-weighted hybrid search.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
-                                        "query": {"type": "string", "description": "Search query or natural language question"},
-                                        "top_k": {"type": "integer", "default": 5}
+                                        "query": {"type": "string", "description": "Search query or problem description"},
+                                        "top_k": {"type": "integer", "default": 5},
+                                        "entity": {"type": "string", "description": "Optional entity filter"},
+                                        "category": {"type": "string", "description": "Optional category filter (Fix/Rule/Knowledge)"}
                                     },
                                     "required": ["query"]
                                 }
@@ -543,24 +910,13 @@ def run_mcp_server():
                                 }
                             },
                             {
-                                "name": "brain_graph",
-                                "description": "Extract a deterministic AST code knowledge graph using Graphify and index it into the Central Brain.",
+                                "name": "brain_export",
+                                "description": "Export a compiled markdown or JSON digest of all permanent system rules, entity knowledge, and recent episodes.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
-                                        "path": {"type": "string", "description": "Project directory path to graph"},
-                                        "code_only": {"type": "boolean", "default": True}
-                                    }
-                                }
-                            },
-                            {
-                                "name": "brain_god_nodes",
-                                "description": "List the most connected architectural hub nodes in a project codebase.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "path": {"type": "string", "description": "Optional project path"},
-                                        "top_n": {"type": "integer", "default": 10}
+                                        "days": {"type": "integer", "default": 30},
+                                        "category": {"type": "string", "description": "Optional category filter"}
                                     }
                                 }
                             },
@@ -578,122 +934,51 @@ def run_mcp_server():
                 args = params.get("arguments", {})
 
                 if name == "brain_query":
-                    res = search_brain(args.get("query"), args.get("top_k", 5))
+                    res = search_brain(args.get("query"), args.get("top_k", 5), entity=args.get("entity"), category=args.get("category"))
                     resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": json.dumps(res, indent=2)}]}}
                 elif name == "brain_remember":
-                    remember(args.get("fact"), args.get("entity", "General"), args.get("category", "Knowledge"))
+                    remember(args.get("fact"), args.get("entity", "General"), args.get("category", "Knowledge"), source="MCP")
                     resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": "Fact saved to Central Brain successfully."}]}}
                 elif name == "brain_forget":
                     cnt = forget(args.get("target"), args.get("entity"))
                     resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": f"Purged {cnt} matching facts from Central Brain."}]}}
                 elif name == "brain_correct":
-                    correct(args.get("entity"), args.get("new_fact"), args.get("old_fact_search"), args.get("category", "Fix"))
+                    correct(args.get("entity"), args.get("new_fact"), args.get("old_fact_search"), args.get("category", "Fix"), source="MCP")
                     resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": f"Successfully corrected memory for entity '{args.get('entity')}'."}]}}
-                elif name == "brain_graph":
-                    ok, msg = run_graphify(args.get("path"), args.get("code_only", True))
-                    resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": msg}]}}
-                elif name == "brain_god_nodes":
-                    res = get_god_nodes(args.get("path"), args.get("top_n", 10))
-                    resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": res}]}}
+                elif name == "brain_export":
+                    digest = export_brain(days=args.get("days", 30), category=args.get("category"))
+                    resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": digest}]}}
                 elif name == "brain_status":
                     res = get_status()
                     resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": json.dumps(res, indent=2)}]}}
                 else:
-                    resp = {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": "Method not found"}}
+                    resp = {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Tool '{name}' not found"}}
             else:
                 resp = {"jsonrpc": "2.0", "id": req_id, "result": {}}
 
             sys.stdout.write(json.dumps(resp) + "\n")
             sys.stdout.flush()
         except Exception as e:
-            sys.stderr.write(f"MCP Exception: {e}\n")
-
-def clean_orphans():
-    """Finds indexed files that no longer exist on disk and purges their chunks & vectors."""
-    conn = get_db()
-    rows = conn.execute("SELECT DISTINCT file_path FROM chunks").fetchall()
-    deleted_files = 0
-    deleted_chunks = 0
-
-    with conn:
-        for r in rows:
-            fp_str = r['file_path']
-            if not Path(fp_str).exists():
-                c_cnt = conn.execute("SELECT COUNT(*) FROM chunks WHERE file_path = ?", (fp_str,)).fetchone()[0]
-                conn.execute("DELETE FROM chunks WHERE file_path = ?", (fp_str,))
-                deleted_files += 1
-                deleted_chunks += c_cnt
-
-    return deleted_files, deleted_chunks
-
-def prune_brain():
-    """Cleans orphan files, deduplicates facts, and vacuums the SQLite database."""
-    conn = get_db()
-    orphans_files, orphan_chunks = clean_orphans()
-
-    # Deduplicate facts table
-    with conn:
-        conn.execute("""
-            DELETE FROM facts WHERE id NOT IN (
-                SELECT MIN(id) FROM facts GROUP BY entity, category, fact
-            )
-        """)
-
-    conn.isolation_level = None
-    conn.execute("VACUUM;")
-    conn.isolation_level = ""
-
-    return orphans_files, orphan_chunks
-
-def sync_brain():
-    """Scans all registered directories/files and updates modified content in vector DB."""
-    sources_file = BRAIN_DIR / "sources.json"
-    default_sources = [
-        str(KNOWLEDGE_DIR),
-        str(PROJECTS_DIR),
-        str(EPISODES_DIR),
-        str(Path.home() / "Documents" / "Configs"),
-        str(Path.home() / ".agents" / "project_map.md"),
-        str(Path.home() / "AGENTS.md")
-    ]
-
-    if not sources_file.exists():
-        with open(sources_file, "w", encoding="utf-8") as f:
-            json.dump(default_sources, f, indent=2)
-        sources = default_sources
-    else:
-        try:
-            with open(sources_file, "r", encoding="utf-8") as f:
-                sources = json.load(f)
-        except Exception:
-            sources = default_sources
-
-    total_chunks = 0
-    synced_paths = 0
-    for src in sources:
-        p = Path(src)
-        if p.is_file():
-            cnt = ingest_file(p)
-            total_chunks += cnt
-            synced_paths += 1
-        elif p.is_dir():
-            cnt = ingest_directory(p)
-            total_chunks += cnt
-            synced_paths += 1
-
-    # Clean up files deleted from disk
-    orphan_files, orphan_chunks = clean_orphans()
-
-    return synced_paths, total_chunks, orphan_files, orphan_chunks
+            err_resp = {"jsonrpc": "2.0", "id": None, "error": {"code": -32603, "message": str(e)}}
+            sys.stdout.write(json.dumps(err_resp) + "\n")
+            sys.stdout.flush()
 
 def main():
     parser = argparse.ArgumentParser(description="Central Brain - Unified Local Agent Memory CLI")
+    parser.add_argument("--json", action="store_true", help="Output all results in structured JSON format")
     sub = parser.add_subparsers(dest="command")
 
     # query
     q_p = sub.add_parser("query", aliases=["search"], help="Query the central brain")
     q_p.add_argument("text", type=str, help="Search query")
     q_p.add_argument("-k", "--top-k", type=int, default=5, help="Number of results")
+    q_p.add_argument("-e", "--entity", type=str, default=None, help="Filter by entity")
+    q_p.add_argument("-c", "--category", type=str, default=None, help="Filter by category")
+    q_p.add_argument("-s", "--source", type=str, default=None, help="Filter by source")
+    q_p.add_argument("--since", type=str, default=None, help="Filter since date (YYYY-MM-DD)")
+    q_p.add_argument("--until", type=str, default=None, help="Filter until date (YYYY-MM-DD)")
+    q_p.add_argument("-p", "--path", type=str, default=None, help="Filter by file path pattern")
+    q_p.add_argument("--json", action="store_true", help="Output in JSON format")
 
     # remember
     r_p = sub.add_parser("remember", help="Save a memory or fact")
@@ -701,11 +986,13 @@ def main():
     r_p.add_argument("-e", "--entity", type=str, default="General", help="Entity or topic name")
     r_p.add_argument("-c", "--category", type=str, default="Knowledge", help="Category (Knowledge/Fix/Rule/Project)")
     r_p.add_argument("-s", "--source", type=str, default="CLI", help="Source agent/user")
+    r_p.add_argument("--json", action="store_true", help="Output in JSON format")
 
     # forget
     f_p = sub.add_parser("forget", help="Remove wrong or outdated memory from the central brain")
     f_p.add_argument("target", type=str, help="Search term/phrase of the fact to remove")
     f_p.add_argument("-e", "--entity", type=str, default=None, help="Specific entity/topic filter")
+    f_p.add_argument("--json", action="store_true", help="Output in JSON format")
 
     # correct
     c_p = sub.add_parser("correct", help="Correct/supersede a memory with a new finding")
@@ -714,114 +1001,159 @@ def main():
     c_p.add_argument("-o", "--old", type=str, default=None, help="Old keyword or fact to replace")
     c_p.add_argument("-c", "--category", type=str, default="Fix", help="Category (Fix/Rule/Knowledge/Project)")
     c_p.add_argument("-s", "--source", type=str, default="CLI", help="Source agent/user")
+    c_p.add_argument("--json", action="store_true", help="Output in JSON format")
 
     # ingest
     i_p = sub.add_parser("ingest", help="Ingest markdown file or directory into vector index")
     i_p.add_argument("path", type=str, help="File or directory path to ingest")
-
-    # graph
-    g_p = sub.add_parser("graph", help="Extract AST code knowledge graph using Graphify and index into Central Brain")
-    g_p.add_argument("path", nargs="?", default=".", help="Project directory to graph (default: current dir)")
-    g_p.add_argument("--deep", action="store_true", help="Run full semantic multimodal extraction via local LLM")
-
-    # god-nodes
-    gn_p = sub.add_parser("god-nodes", help="List architectural code hubs and most connected modules")
-    gn_p.add_argument("path", nargs="?", default=None, help="Optional project directory or path to graph.json")
-    gn_p.add_argument("-n", "--top", type=int, default=10, help="Number of nodes to show (default: 10)")
-
-    # callers
-    cl_p = sub.add_parser("callers", help="Find callers, callees, and dependencies for a symbol")
-    cl_p.add_argument("symbol", type=str, help="Function, class, or module name to query")
-    cl_p.add_argument("path", nargs="?", default=None, help="Optional project directory or graph.json path")
+    i_p.add_argument("--json", action="store_true", help="Output in JSON format")
 
     # sync
-    sub.add_parser("sync", help="Sync all registered knowledge bases & files")
+    s_p = sub.add_parser("sync", help="Sync all registered knowledge bases & files")
+    s_p.add_argument("--json", action="store_true", help="Output in JSON format")
 
     # prune
-    sub.add_parser("prune", help="Clean deleted files, deduplicate facts, and reclaim disk space")
+    p_p = sub.add_parser("prune", help="Clean deleted files, deduplicate facts, and reclaim disk space")
+    p_p.add_argument("--json", action="store_true", help="Output in JSON format")
+
+    # backup
+    bk_p = sub.add_parser("backup", help="Create a transactional snapshot and backup of Central Brain")
+    bk_p.add_argument("output", nargs="?", default=None, help="Destination archive path (.tar.gz)")
+    bk_p.add_argument("--no-vault", action="store_true", help="Backup SQLite DB only, omit markdown vaults")
+    bk_p.add_argument("--json", action="store_true", help="Output in JSON format")
+
+    # restore
+    rst_p = sub.add_parser("restore", help="Restore Central Brain from a backup archive")
+    rst_p.add_argument("archive", type=str, help="Backup archive file (.tar.gz)")
+    rst_p.add_argument("--force", action="store_true", help="Skip pre-restore safety snapshot")
+    rst_p.add_argument("--json", action="store_true", help="Output in JSON format")
+
+    # export
+    exp_p = sub.add_parser("export", help="Export compiled memory digest (MEMORY.md or JSON)")
+    exp_p.add_argument("output", nargs="?", default=None, help="Output destination file")
+    exp_p.add_argument("--format", choices=["markdown", "json"], default="markdown", help="Digest format")
+    exp_p.add_argument("-c", "--category", type=str, default=None, help="Filter by category")
+    exp_p.add_argument("-e", "--entity", type=str, default=None, help="Filter by entity")
+    exp_p.add_argument("-d", "--days", type=int, default=30, help="Days of episode history to include")
+    exp_p.add_argument("--json", action="store_true", help="Output in JSON format")
 
     # status
-    sub.add_parser("status", help="Display Central Brain metrics")
+    st_p = sub.add_parser("status", help="Display Central Brain metrics")
+    st_p.add_argument("--json", action="store_true", help="Output in JSON format")
 
     # mcp
     sub.add_parser("mcp", help="Run MCP stdio server")
 
     args = parser.parse_args()
     ensure_dirs()
+    is_json = getattr(args, "json", False) or parser.get_default("json")
 
     if args.command in ["query", "search"]:
-        res = search_brain(args.text, args.top_k)
-        print(f"\n🧠 CENTRAL BRAIN SEARCH RESULTS for: '{args.text}'\n" + "="*60)
-
-        if res["facts"]:
-            print("\n📌 RELEVANT FACTS:")
-            for f in res["facts"]:
-                print(f"  • [{f['category']}] ({f['entity']}): {f['fact']} ({f['timestamp']})")
-
-        if res["chunks"]:
-            print("\n📄 RELEVANT KNOWLEDGE CHUNKS:")
-            for idx, c in enumerate(res["chunks"], 1):
-                path_name = Path(c['file_path']).name
-                print(f"\n--- Result #{idx} [Score: {c['score']}] | File: {path_name} ({c['header']}) ---")
-                print(c['content'].strip()[:400] + ("..." if len(c['content']) > 400 else ""))
+        res = search_brain(
+            args.text, top_k=args.top_k, entity=args.entity, category=args.category,
+            source=args.source, since=args.since, until=args.until, path_filter=args.path
+        )
+        if is_json:
+            print(json.dumps({"status": "success", "command": "query", "data": res, "timestamp": datetime.now().isoformat()}, indent=2))
         else:
-            print("\nNo matching chunks found.")
-        print()
+            print(f"\n🧠 CENTRAL BRAIN SEARCH RESULTS for: '{args.text}'\n" + "="*60)
+            if res["facts"]:
+                print("\n📌 RELEVANT FACTS:")
+                for f in res["facts"]:
+                    print(f"  • [{f['category']}] ({f['entity']}): {f['fact']} ({f['timestamp']})")
+            if res["chunks"]:
+                print("\n📄 RELEVANT KNOWLEDGE CHUNKS:")
+                for idx, c in enumerate(res["chunks"], 1):
+                    path_name = Path(c['file_path']).name
+                    print(f"\n--- Result #{idx} [Score: {c['score']}] | File: {path_name} ({c['header']}) ---")
+                    print(c['content'].strip()[:400] + ("..." if len(c['content']) > 400 else ""))
+            else:
+                print("\nNo matching chunks found.")
+            print()
 
     elif args.command == "remember":
         remember(args.fact, args.entity, args.category, args.source)
-        print(f"✅ Saved memory to Central Brain: [{args.category}] ({args.entity}): {args.fact}")
+        if is_json:
+            print(json.dumps({"status": "success", "command": "remember", "data": {"entity": args.entity, "category": args.category, "fact": args.fact, "source": args.source}}, indent=2))
+        else:
+            print(f"✅ Saved memory to Central Brain: [{args.category}] ({args.entity}): {args.fact}")
 
     elif args.command == "forget":
         cnt = forget(args.target, args.entity)
-        print(f"🗑️ Central Brain: Purged {cnt} matching facts matching '{args.target}' (Entity: {args.entity or 'Any'}).")
+        if is_json:
+            print(json.dumps({"status": "success", "command": "forget", "data": {"purged_count": cnt, "target": args.target, "entity": args.entity}}, indent=2))
+        else:
+            print(f"🗑️ Central Brain: Purged {cnt} matching facts matching '{args.target}' (Entity: {args.entity or 'Any'}).")
 
     elif args.command == "correct":
         correct(args.entity, args.new_fact, args.old, args.category, args.source)
-        print(f"✨ Central Brain: Successfully corrected memory for [{args.category}] ({args.entity}) -> {args.new_fact}")
-
-    elif args.command == "graph":
-        print(f"🕸️ Extracting code knowledge graph for '{args.path}'...")
-        ok, msg = run_graphify(args.path, code_only=not args.deep)
-        print(msg)
-
-    elif args.command == "god-nodes":
-        res = get_god_nodes(args.path, args.top)
-        print(f"\n🏛️ ARCHITECTURAL GOD NODES (Most Connected):\n{res}\n")
-
-    elif args.command == "callers":
-        res = query_graph_connections(args.symbol, args.path)
-        print(f"\n{res}\n")
+        if is_json:
+            print(json.dumps({"status": "success", "command": "correct", "data": {"entity": args.entity, "category": args.category, "new_fact": args.new_fact, "source": args.source}}, indent=2))
+        else:
+            print(f"✨ Central Brain: Successfully corrected memory for [{args.category}] ({args.entity}) -> {args.new_fact}")
 
     elif args.command == "ingest":
         p = Path(args.path).resolve()
-        if p.is_file():
-            cnt = ingest_file(p)
-            print(f"✅ Ingested file: {p.name} ({cnt} chunks indexed)")
-        elif p.is_dir():
-            cnt = ingest_directory(p)
-            print(f"✅ Ingested directory: {p} ({cnt} total chunks indexed)")
+        cnt = ingest_file(p) if p.is_file() else (ingest_directory(p) if p.is_dir() else 0)
+        if is_json:
+            print(json.dumps({"status": "success" if cnt > 0 else "error", "command": "ingest", "data": {"path": str(p), "indexed_chunks": cnt}}, indent=2))
         else:
-            print(f"❌ Error: Path '{args.path}' does not exist.")
+            if p.exists():
+                print(f"✅ Ingested: {p} ({cnt} chunks indexed)")
+            else:
+                print(f"❌ Error: Path '{args.path}' does not exist.")
 
     elif args.command == "sync":
         paths, chunks, del_files, del_chunks = sync_brain()
-        msg = f"🔄 Central Brain Sync Complete: Processed {paths} sources ({chunks} total chunks active)."
-        if del_files > 0:
-            msg += f" Purged {del_files} deleted files ({del_chunks} orphan chunks removed)."
-        print(msg)
+        if is_json:
+            print(json.dumps({"status": "success", "command": "sync", "data": {"synced_paths": paths, "total_chunks": chunks, "purged_files": del_files, "purged_chunks": del_chunks}}, indent=2))
+        else:
+            msg = f"🔄 Central Brain Sync Complete: Processed {paths} sources ({chunks} total chunks active)."
+            if del_files > 0:
+                msg += f" Purged {del_files} deleted files ({del_chunks} orphan chunks removed)."
+            print(msg)
 
     elif args.command == "prune":
         del_files, del_chunks = prune_brain()
-        print(f"🧹 Central Brain Prune Complete: Cleaned {del_files} deleted files ({del_chunks} chunks removed). Fact table deduplicated and database vacuumed.")
+        if is_json:
+            print(json.dumps({"status": "success", "command": "prune", "data": {"purged_files": del_files, "purged_chunks": del_chunks}}, indent=2))
+        else:
+            print(f"🧹 Central Brain Prune Complete: Cleaned {del_files} deleted files ({del_chunks} chunks removed). Fact table deduplicated and database vacuumed.")
+
+    elif args.command == "backup":
+        ok, msg, manifest = backup_brain(args.output, include_vault=not args.no_vault)
+        if is_json:
+            print(json.dumps({"status": "success" if ok else "error", "command": "backup", "data": {"message": msg, "manifest": manifest}}, indent=2))
+        else:
+            print(f"{'📦' if ok else '❌'} {msg}")
+
+    elif args.command == "restore":
+        ok, msg = restore_brain(args.archive, force=args.force)
+        if is_json:
+            print(json.dumps({"status": "success" if ok else "error", "command": "restore", "data": {"message": msg}}, indent=2))
+        else:
+            print(f"{'✅' if ok else '❌'} {msg}")
+
+    elif args.command == "export":
+        res = export_brain(args.output, fmt=args.format, category=args.category, entity=args.entity, days=args.days)
+        if is_json:
+            print(json.dumps({"status": "success", "command": "export", "data": {"digest": res if not args.output else f"Saved to {args.output}"}}, indent=2))
+        else:
+            if not args.output:
+                print(res)
+            else:
+                print(f"📄 Central Brain digest exported to: {args.output}")
 
     elif args.command == "status":
         st = get_status()
-        print("\n🧠 CENTRAL BRAIN SYSTEM STATUS")
-        print("="*40)
-        for k, v in st.items():
-            print(f"  • {k.replace('_', ' ').title()}: {v}")
-        print()
+        if is_json:
+            print(json.dumps({"status": "success", "command": "status", "data": st, "timestamp": datetime.now().isoformat()}, indent=2))
+        else:
+            print("\n🧠 CENTRAL BRAIN SYSTEM STATUS")
+            print("="*40)
+            for k, v in st.items():
+                print(f"  • {k.replace('_', ' ').title()}: {v}")
+            print()
 
     elif args.command == "mcp":
         run_mcp_server()
