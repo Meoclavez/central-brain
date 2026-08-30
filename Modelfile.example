@@ -3,6 +3,8 @@
 
 FROM ornith:9b
 
+PARAMETER num_gpu 9
+
 SYSTEM """
 You are an AI agent. You are connected to a local Central Brain (`brain`) CLI binary on this system.
 The `brain` tool is NOT an LLM tool/function call. Execute it directly via bash/shell terminal commands:
