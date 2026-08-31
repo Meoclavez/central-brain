@@ -1,39 +1,44 @@
-# Central Brain Agent Directives
+# CENTRAL BRAIN AGENT DIRECTIVE (ARCH LINUX / ASUS TUF)
 
-You are connected to a local **Central Brain (`brain`)** CLI tool on this system.
-The `brain` tool is NOT an LLM function/tool call. It is an executable CLI binary available in your system path. Execute it directly using shell/bash commands (e.g. `run_command` or bash terminal).
+You are an AI coding and system assistant connected to a local Central Brain (`brain`) CLI binary.
+The `brain` tool is NOT an LLM tool/function call. Execute it directly via bash/shell terminal commands:
 
-1. **SEARCH BEFORE ANALYZING (BASH)**:
-   - Before troubleshooting, writing code, or answering technical questions, execute the bash command:
-     `brain query "<topic/error/feature>"`
-   - Use the retrieved output to inform your technical response.
+1. **SPEC-DRIVEN EXECUTION LOOP (BASH)**:
+   - **Discuss**: Clarify requirements and constraints before writing code.
+   - **Plan**: Inspect project state with `brain state` and decompose work into testable steps.
+   - **Execute**: Use isolated subagents for heavy codebase exploration to prevent context rot.
+   - **Verify**: Empirically verify code through tests, compilation, and shell commands.
+   - **Ship & Remember**: Commit changes and persist verified facts to the brain.
 
-2. **RECORD SOLUTIONS & LESSONS (BASH)**:
-   - Immediately after solving a problem, fixing a bug, or updating a config, execute the bash command:
-     `brain remember "<fact/solution>" --entity "<Topic>" --category "<Fix|Rule|Knowledge|Project>"`
+2. **BEFORE ANSWERING OR CODING (BASH)**:
+   - Always query the Central Brain to retrieve verified system facts, kernel configurations, and past fixes:
+     `brain query "<keywords_or_problem_description>"`
+   - To inspect project status, milestones, and blockers:
+     `brain state [project_path]`
+   - Read `.agents/project_map.md` to locate active scripts and system rules.
 
-3. **CORRECT & INVALIDATE OUTDATED MEMORIES (BASH)**:
-   - When a previous finding or assumption is discovered to be wrong, execute:
-     `brain correct "<entity>" "<new_finding>" --category "<Fix|Rule|Knowledge|Project>"`
-   - To completely remove an invalid or false memory, execute:
-     `brain forget "<keyword/target>"`
+3. **AFTER RESOLVING ISSUES OR DISCOVERING FIXES (BASH)**:
+   - Persist findings immediately so they survive context resets and kernel changes:
+     `brain remember "<verified_fix_or_rule>" --entity "<Topic>" --category "<Fix|Rule|Knowledge|Project>"`
 
-4. **INGEST, SYNC & PRUNE KNOWLEDGE (BASH)**:
-   - When creating or updating project documentation, execute:
-     `brain ingest <path>`
-     `brain sync`
-   - After removing, moving, or deleting files, execute:
-     `brain prune`
-     (Purges orphan files deleted from disk, deduplicates facts, and vacuums SQLite storage).
+4. **CORRECTING SUPERSEDED / WRONG MEMORIES (BASH)**:
+   - When a past solution is replaced or no longer works:
+     `brain correct "<Topic>" "<new_verified_solution>" --category "Fix"`
+   - To erase an invalid memory:
+     `brain forget "<search_term>"`
 
-5. **BACKUP, EXPORT & PRECISION FILTERING (BASH)**:
-   - For structured JSON output in scripts/agents, pass `--json` to any command (e.g. `brain query "<query>" --json`).
-   - To filter search by category or entity, use:
+5. **SYNC, BACKUP & PRECISION FILTERING (BASH)**:
+   - For structured JSON output, pass `--json` to any command (e.g. `brain query "<query>" --json`).
+   - To filter search by category or entity:
      `brain query "<query>" -c "<Fix|Rule|Knowledge>" -e "<Entity>"`
-   - To export a compiled markdown memory digest, execute:
+   - To scaffold a spec-driven planning structure for a new project:
+     `brain init-project <name> [path] -d "description"`
+   - To export a compiled memory digest:
      `brain export [output_file.md]`
-   - To create a full point-in-time snapshot, execute:
+   - To create a full point-in-time snapshot:
      `brain backup [path.tar.gz]`
+   - To sync or clean:
+     `brain sync` / `brain prune`
 
 6. **EMPIRICAL ANSWERS**:
-   - Base technical decisions on actual outputs returned from `brain query` and terminal commands.
+   - Base technical decisions on actual outputs returned from `brain query`, `brain state`, and terminal commands.

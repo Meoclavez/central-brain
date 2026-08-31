@@ -83,6 +83,12 @@ brain correct "Wi-Fi" "Realtek Wi-Fi fix is setting rtw89 aspm disabled" --categ
 # Erase an invalid, false, or obsolete memory completely
 brain forget "temporary false assumption" --entity "Wi-Fi"
 
+# Inspect spec-driven project state, active phase, and blockers (.planning/STATE.md)
+brain state [project_path] --json
+
+# Scaffold a clean spec-driven .planning/ structure in a project
+brain init-project <name> [project_path] -d "Project description"
+
 # Export a compiled Markdown memory digest or JSON state
 brain export ~/MEMORY.md -d 7
 
@@ -95,7 +101,7 @@ brain restore ~/.central_brain/backups/brain_backup_YYYYMMDD_HHMMSS.tar.gz
 # Ingest a new Markdown document or project folder
 brain ingest /path/to/project/
 
-# Sync all registered directories listed in sources.json
+# Sync all registered directories listed in sources.json (including .planning/ folders)
 brain sync
 
 # Clean deleted files, deduplicate facts, and vacuum DB

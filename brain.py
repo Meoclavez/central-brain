@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Central Brain - Unified Local Memory Engine for Multi-Platform AI Agents
+Central Brain - Unified Local Memory & Spec-Driven State Engine for Multi-Platform AI Agents
 Features:
   - Fast batch embeddings via Ollama /api/embed (with safe truncation & retry)
   - Code-fence-safe hierarchical Markdown chunking with breadcrumbs
   - Recency-weighted hybrid search (Dense Vectors + SQLite FTS5 BM25 + Exponential Decay)
   - Multi-field precision filtering (by entity, category, source, time range, file path)
+  - Spec-driven project state tracking (.planning/ & STATE.md)
   - Automated transactional SQLite & vault backups (brain backup / restore)
   - Compiled memory digest export (brain export)
   - Universal JSON output mode (--json) for seamless agent scriptability
@@ -443,7 +444,7 @@ def calculate_recency_and_category_boost(doc: dict) -> float:
 
     if "[Fix]" in content or "Fix" in header or "Fix" in fp:
         boost *= 1.20
-    elif "[Rule]" in content or "project_map" in fp:
+    elif "[Rule]" in content or "project_map" in fp or "STATE.md" in fp:
         boost *= 1.15
 
     return boost
@@ -549,6 +550,134 @@ def search_brain(query: str, top_k: int = 5, entity: str = None, category: str =
         "chunks": [{"score": round(score, 4), **{k: v for k, v in doc.items() if k != 'embedding'}} for score, doc in top_docs],
         "facts": [dict(f) for f in facts_rows]
     }
+
+def init_project(project_name: str, target_dir: Path = None, description: str = "") -> tuple[bool, str]:
+    """Scaffolds a clean .planning/ spec-driven structure and registers it with Central Brain."""
+    if not target_dir:
+        target_dir = Path.cwd()
+    else:
+        target_dir = Path(target_dir).resolve()
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    planning_dir = target_dir / ".planning"
+    planning_dir.mkdir(parents=True, exist_ok=True)
+    (planning_dir / "phases").mkdir(parents=True, exist_ok=True)
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    project_md = planning_dir / "PROJECT.md"
+    if not project_md.exists():
+        project_md.write_text(f"""# Project: {project_name}
+
+**Created:** {today_str}  
+**Description:** {description or 'Add project description here'}
+
+## 🎯 Goals & Scope
+- [ ] Goal 1: Core functionality
+- [ ] Goal 2: Integration & testing
+
+## 🛠️ Technology Stack
+- Language/Framework: 
+- Storage/Database: 
+- Key Dependencies: 
+
+## 🏗️ Architecture
+- Components: 
+- Interfaces: 
+""", encoding="utf-8")
+
+    roadmap_md = planning_dir / "ROADMAP.md"
+    if not roadmap_md.exists():
+        roadmap_md.write_text(f"""# Project Roadmap: {project_name}
+
+## 📌 Milestones
+- [ ] **Phase 1: Architecture & Foundations** (Current)
+- [ ] **Phase 2: Core Feature Implementation**
+- [ ] **Phase 3: Verification, Testing & Polish**
+""", encoding="utf-8")
+
+    state_md = planning_dir / "STATE.md"
+    if not state_md.exists():
+        state_md.write_text(f"""# Project State: {project_name}
+
+**Updated:** {today_str}  
+**Active Phase:** Phase 1: Architecture & Foundations  
+**Status:** In Progress
+
+## 🧭 Recent Decisions
+- Initialized spec-driven planning structure (.planning/) on {today_str}.
+
+## 🚧 Blockers / Risks
+- None currently identified.
+
+## 📋 Next Actions
+1. Define core requirements in .planning/PROJECT.md.
+2. Outline detailed implementation steps.
+""", encoding="utf-8")
+
+    # Register in sources.json
+    sources_file = BRAIN_DIR / "sources.json"
+    sources = []
+    if sources_file.exists():
+        try:
+            with open(sources_file, "r", encoding="utf-8") as f:
+                sources = json.load(f)
+        except Exception:
+            sources = []
+
+    str_plan = str(planning_dir)
+    if str_plan not in sources:
+        sources.append(str_plan)
+        with open(sources_file, "w", encoding="utf-8") as f:
+            json.dump(sources, f, indent=2)
+
+    ingest_directory(planning_dir)
+    remember(f"Initialized project '{project_name}' with .planning/ state tracking in {target_dir}", entity=project_name, category="Project", source="CLI")
+
+    return True, f"Initialized .planning/ structure in {target_dir} and registered with Central Brain."
+
+def get_project_state(target_dir: Path = None) -> dict:
+    """Reads and parses .planning/STATE.md or PROJECT.md from a project directory."""
+    if not target_dir:
+        target_dir = Path.cwd()
+    else:
+        target_dir = Path(target_dir).resolve()
+
+    planning_dir = None
+    curr = target_dir
+    while curr != curr.parent:
+        if (curr / ".planning").is_dir():
+            planning_dir = curr / ".planning"
+            break
+        curr = curr.parent
+
+    if not planning_dir or not planning_dir.exists():
+        map_file = target_dir / ".agents" / "project_map.md"
+        if map_file.exists():
+            return {
+                "project_path": str(target_dir),
+                "type": "project_map",
+                "content": map_file.read_text(encoding="utf-8", errors="ignore")
+            }
+        return {"error": f"No .planning/ or .agents/project_map.md found in {target_dir} or parent directories."}
+
+    res = {
+        "project_path": str(planning_dir.parent),
+        "planning_dir": str(planning_dir),
+        "files": [f.name for f in planning_dir.glob("*.md")]
+    }
+
+    state_file = planning_dir / "STATE.md"
+    if state_file.exists():
+        res["state"] = state_file.read_text(encoding="utf-8", errors="ignore")
+    project_file = planning_dir / "PROJECT.md"
+    if project_file.exists():
+        res["project"] = project_file.read_text(encoding="utf-8", errors="ignore")
+    roadmap_file = planning_dir / "ROADMAP.md"
+    if roadmap_file.exists():
+        res["roadmap"] = roadmap_file.read_text(encoding="utf-8", errors="ignore")
+
+    return res
 
 def clean_orphans():
     """Finds indexed files that no longer exist on disk and purges their chunks & FTS entries."""
@@ -783,6 +912,14 @@ def sync_brain():
         except Exception:
             sources = default_sources
 
+    # Also auto-discover any .planning folders under ~/Projects
+    projects_base = Path.home() / "Projects"
+    if projects_base.exists():
+        for pl_dir in projects_base.glob("*/.planning"):
+            pl_str = str(pl_dir)
+            if pl_str not in sources:
+                sources.append(pl_str)
+
     total_chunks = 0
     synced_paths = 0
     for src in sources:
@@ -847,7 +984,7 @@ def run_mcp_server():
                     "result": {
                         "protocolVersion": "2024-11-05",
                         "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "central-brain", "version": "2.0.0"}
+                        "serverInfo": {"name": "central-brain", "version": "2.1.0"}
                     }
                 }
             elif method == "tools/list":
@@ -865,7 +1002,7 @@ def run_mcp_server():
                                         "query": {"type": "string", "description": "Search query or problem description"},
                                         "top_k": {"type": "integer", "default": 5},
                                         "entity": {"type": "string", "description": "Optional entity filter"},
-                                        "category": {"type": "string", "description": "Optional category filter (Fix/Rule/Knowledge)"}
+                                        "category": {"type": "string", "description": "Optional category filter (Fix/Rule/Knowledge/Project)"}
                                     },
                                     "required": ["query"]
                                 }
@@ -881,6 +1018,29 @@ def run_mcp_server():
                                         "category": {"type": "string", "default": "Knowledge"}
                                     },
                                     "required": ["fact"]
+                                }
+                            },
+                            {
+                                "name": "brain_state",
+                                "description": "Get current spec-driven project state, active phase, decisions, and blockers for a project.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "path": {"type": "string", "description": "Optional project path"}
+                                    }
+                                }
+                            },
+                            {
+                                "name": "brain_init_project",
+                                "description": "Scaffold spec-driven .planning/ structure (PROJECT.md, ROADMAP.md, STATE.md) for a project.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string", "description": "Project name"},
+                                        "path": {"type": "string", "description": "Optional target directory"},
+                                        "description": {"type": "string", "description": "Brief description"}
+                                    },
+                                    "required": ["name"]
                                 }
                             },
                             {
@@ -939,6 +1099,12 @@ def run_mcp_server():
                 elif name == "brain_remember":
                     remember(args.get("fact"), args.get("entity", "General"), args.get("category", "Knowledge"), source="MCP")
                     resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": "Fact saved to Central Brain successfully."}]}}
+                elif name == "brain_state":
+                    res = get_project_state(args.get("path"))
+                    resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": json.dumps(res, indent=2)}]}}
+                elif name == "brain_init_project":
+                    ok, msg = init_project(args.get("name"), args.get("path"), args.get("description", ""))
+                    resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": msg}]}}
                 elif name == "brain_forget":
                     cnt = forget(args.get("target"), args.get("entity"))
                     resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": f"Purged {cnt} matching facts from Central Brain."}]}}
@@ -964,7 +1130,7 @@ def run_mcp_server():
             sys.stdout.flush()
 
 def main():
-    parser = argparse.ArgumentParser(description="Central Brain - Unified Local Agent Memory CLI")
+    parser = argparse.ArgumentParser(description="Central Brain - Unified Local Agent Memory & State CLI")
     parser.add_argument("--json", action="store_true", help="Output all results in structured JSON format")
     sub = parser.add_subparsers(dest="command")
 
@@ -979,6 +1145,18 @@ def main():
     q_p.add_argument("--until", type=str, default=None, help="Filter until date (YYYY-MM-DD)")
     q_p.add_argument("-p", "--path", type=str, default=None, help="Filter by file path pattern")
     q_p.add_argument("--json", action="store_true", help="Output in JSON format")
+
+    # state / plan
+    st_cmd = sub.add_parser("state", aliases=["plan"], help="Inspect spec-driven project state (.planning/STATE.md)")
+    st_cmd.add_argument("path", nargs="?", default=None, help="Optional project directory")
+    st_cmd.add_argument("--json", action="store_true", help="Output in JSON format")
+
+    # init-project
+    ip_cmd = sub.add_parser("init-project", help="Scaffold spec-driven .planning/ structure (PROJECT.md, ROADMAP.md, STATE.md)")
+    ip_cmd.add_argument("name", type=str, help="Project name")
+    ip_cmd.add_argument("path", nargs="?", default=None, help="Target project directory (default: current dir)")
+    ip_cmd.add_argument("-d", "--description", type=str, default="", help="Project description")
+    ip_cmd.add_argument("--json", action="store_true", help="Output in JSON format")
 
     # remember
     r_p = sub.add_parser("remember", help="Save a memory or fact")
@@ -1070,6 +1248,30 @@ def main():
             else:
                 print("\nNo matching chunks found.")
             print()
+
+    elif args.command in ["state", "plan"]:
+        res = get_project_state(args.path)
+        if is_json:
+            print(json.dumps({"status": "success" if "error" not in res else "error", "command": "state", "data": res}, indent=2))
+        else:
+            if "error" in res:
+                print(f"❌ {res['error']}")
+            elif res.get("type") == "project_map":
+                print(f"\n🗺️ PROJECT MAP ({res['project_path']}):\n" + "="*50)
+                print(res["content"])
+            else:
+                print(f"\n🧭 PROJECT STATE ({res['project_path']}):\n" + "="*50)
+                if "state" in res:
+                    print(res["state"])
+                elif "project" in res:
+                    print(res["project"])
+
+    elif args.command == "init-project":
+        ok, msg = init_project(args.name, args.path, args.description)
+        if is_json:
+            print(json.dumps({"status": "success" if ok else "error", "command": "init-project", "data": {"message": msg, "project": args.name}}, indent=2))
+        else:
+            print(f"{'✅' if ok else '❌'} {msg}")
 
     elif args.command == "remember":
         remember(args.fact, args.entity, args.category, args.source)
