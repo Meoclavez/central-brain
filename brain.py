@@ -694,19 +694,74 @@ def init_project(project_name: str, target_dir: Path = None, description: str = 
 
     return True, f"Initialized .planning/ structure in {target_dir} and registered with Central Brain."
 
+def find_project_root(start_dir: Path) -> Path:
+    """Finds the root of the project by ascending until a project marker (.git, package.json, etc.) or home is reached."""
+    curr = start_dir.resolve()
+    if curr == Path.home() or curr == curr.parent:
+        return curr
+
+    project_markers = [".git", ".hg", ".svn", "package.json", "Cargo.toml", "pyproject.toml", "go.mod", "CMakeLists.txt"]
+
+    while curr != curr.parent and curr != Path.home():
+        if any((curr / marker).exists() for marker in project_markers):
+            return curr
+        curr = curr.parent
+
+    return start_dir.resolve()
+
+def extract_project_doc_summary(content: str, max_overview_lines: int = 12) -> tuple[str, list[str]]:
+    """Extracts a clean, token-efficient summary from a project README or documentation file.
+    Returns (summary_text, all_section_titles)."""
+    clean = re.sub(r"<!--.*?-->", "", content, flags=re.DOTALL)
+    clean = re.sub(r"<[^>]+>", "", clean)
+
+    _, all_secs = extract_markdown_section(content, "__all__")
+
+    clean_lines = [l.strip() for l in clean.splitlines() if l.strip()]
+    overview_lines = []
+    for l in clean_lines:
+        if l.startswith("## ") and len(overview_lines) > 2:
+            break
+        if not l.startswith("---") and not l.startswith("!["):
+            overview_lines.append(l)
+        if len(overview_lines) >= max_overview_lines:
+            break
+
+    overview_text = "\n".join(overview_lines)
+
+    tech_stack, _ = extract_markdown_section(content, "Tech Stack")
+    if not tech_stack:
+        tech_stack, _ = extract_markdown_section(content, "Stack")
+
+    features, _ = extract_markdown_section(content, "Features")
+
+    summary_parts = [overview_text]
+    if tech_stack:
+        summary_parts.append(tech_stack)
+    elif features:
+        feat_lines = features.splitlines()[:12]
+        summary_parts.append("\n".join(feat_lines))
+
+    return "\n\n".join(summary_parts).strip(), all_secs
+
 def get_project_state(target_dir: Path = None) -> dict:
-    """Reads and parses .planning/STATE.md, PROJECT.md, or .agents/project_map.md with recursive fallback."""
+    """Reads and parses .planning/STATE.md, PROJECT.md, or .agents/project_map.md with project boundary isolation."""
     if not target_dir:
         target_dir = Path.cwd()
     else:
         target_dir = Path(target_dir).resolve()
 
-    # 1. Search upwards for .planning directory
+    project_root = find_project_root(target_dir)
+    is_home_root = (project_root == Path.home())
+
+    # 1. Search upwards for .planning directory up to project_root
     planning_dir = None
     curr = target_dir
-    while curr != curr.parent:
+    while True:
         if (curr / ".planning").is_dir():
             planning_dir = curr / ".planning"
+            break
+        if curr == project_root or curr == curr.parent or curr == Path.home():
             break
         curr = curr.parent
 
@@ -738,18 +793,20 @@ def get_project_state(target_dir: Path = None) -> dict:
 
         return res
 
-    # 2. Search upwards for .agents/project_map.md
+    # 2. Search upwards for .agents/project_map.md up to project_root
     curr = target_dir
     map_file = None
-    while curr != curr.parent:
+    while True:
         candidate = curr / ".agents" / "project_map.md"
         if candidate.is_file():
             map_file = candidate
             break
+        if curr == project_root or curr == curr.parent or curr == Path.home():
+            break
         curr = curr.parent
 
-    # 3. Fallback to ~/.agents/project_map.md
-    if not map_file:
+    # 3. Only fall back to ~/.agents/project_map.md if we are actually targeting home
+    if not map_file and is_home_root:
         home_map = Path.home() / ".agents" / "project_map.md"
         if home_map.is_file():
             map_file = home_map
@@ -764,7 +821,56 @@ def get_project_state(target_dir: Path = None) -> dict:
             "content": content
         }
 
-    return {"error": f"No .planning/ or .agents/project_map.md found in {target_dir} or parent directories."}
+    # 4. Fallback for unmapped projects: check for project documentation (README.md, AGENTS.md, etc.)
+    doc_candidates = [
+        ("README.md", "readme"),
+        ("readme.md", "readme"),
+        ("AGENTS.md", "agents_rules"),
+        ("CLAUDE.md", "agent_rules")
+    ]
+    resolved_doc = None
+    doc_type = None
+    for filename, dtype in doc_candidates:
+        cand = project_root / filename
+        if cand.is_file():
+            resolved_doc = cand
+            doc_type = dtype
+            break
+        if target_dir != project_root:
+            cand_sub = target_dir / filename
+            if cand_sub.is_file():
+                resolved_doc = cand_sub
+                doc_type = dtype
+                break
+
+    # Count indexed chunks in Central Brain DB for this project
+    conn = get_db()
+    indexed_count = 0
+    try:
+        row = conn.execute("SELECT COUNT(*) FROM chunks WHERE file_path LIKE ?", (f"{project_root}%",)).fetchone()
+        if row:
+            indexed_count = row[0]
+    except Exception:
+        pass
+
+    if resolved_doc and resolved_doc.exists():
+        doc_content = resolved_doc.read_text(encoding="utf-8", errors="ignore")
+        return {
+            "project_path": str(project_root),
+            "resolved_file": str(resolved_doc),
+            "file_type": doc_type,
+            "type": "project_doc",
+            "content": doc_content,
+            "indexed_chunks": indexed_count,
+            "is_fallback": True
+        }
+
+    return {
+        "error": f"No .planning/, .agents/project_map.md, or project documentation found in {target_dir} or project root ({project_root}).",
+        "project_path": str(project_root),
+        "indexed_chunks": indexed_count,
+        "suggestion": f"Run 'brain map init {project_root}' or 'brain init-project \"{project_root.name}\"' to initialize state tracking."
+    }
 
 def extract_markdown_section(content: str, target_section: str) -> tuple[str | None, list[str]]:
     """Extracts a specific markdown section (by title substring match) from a markdown document.
@@ -1438,13 +1544,32 @@ def sync_brain():
         except Exception:
             sources = default_sources
 
-    # Also auto-discover any .planning folders under ~/Projects
+    # Also auto-discover any .planning folders and project maps under ~/Projects
+    sources_modified = False
     projects_base = Path.home() / "Projects"
     if projects_base.exists():
         for pl_dir in projects_base.glob("*/.planning"):
             pl_str = str(pl_dir)
             if pl_str not in sources:
                 sources.append(pl_str)
+                sources_modified = True
+        for map_f in projects_base.glob("*/.agents/project_map.md"):
+            map_str = str(map_f)
+            if map_str not in sources:
+                sources.append(map_str)
+                sources_modified = True
+        for map_f2 in projects_base.glob("*/*/.agents/project_map.md"):
+            map_str2 = str(map_f2)
+            if map_str2 not in sources:
+                sources.append(map_str2)
+                sources_modified = True
+
+    if sources_modified:
+        try:
+            with open(SOURCES_PATH, "w", encoding="utf-8") as f:
+                json.dump(sources, f, indent=2)
+        except Exception:
+            pass
 
     total_chunks = 0
     synced_paths = 0
@@ -1741,6 +1866,9 @@ def main():
     st_cmd = sub.add_parser("state", aliases=["plan"], help="Inspect or mutate spec-driven project state (.planning/STATE.md)")
     st_cmd.add_argument("path", nargs="?", default=None, help="Optional project directory")
     st_cmd.add_argument("-s", "--section", type=str, default=None, help="Filter output to a specific section name")
+    st_cmd.add_argument("-c", "--compact", "--summary", action="store_true", dest="compact", help="Token-efficient summary view with section directory")
+    st_cmd.add_argument("--outline", action="store_true", help="Display only the section outline of the document")
+    st_cmd.add_argument("--full", action="store_true", help="Display full un-truncated content")
     st_cmd.add_argument("--max-tokens", type=int, default=None, help="Limit output to approximate token budget")
     st_cmd.add_argument("--add", nargs=2, metavar=("TYPE", "TEXT"), help="Add an entry: --add <action|decision|blocker> '<text>'")
     st_cmd.add_argument("--phase", type=str, default=None, help="Update active phase in STATE.md")
@@ -1754,6 +1882,9 @@ def main():
     map_show = map_sub.add_parser("show", help="Display the active project map")
     map_show.add_argument("path", nargs="?", default=None, help="Optional project directory")
     map_show.add_argument("-s", "--section", type=str, default=None, help="Filter output to a specific section name")
+    map_show.add_argument("-c", "--compact", "--summary", action="store_true", dest="compact", help="Token-efficient summary view with section directory")
+    map_show.add_argument("--outline", action="store_true", help="Display only the section outline of the document")
+    map_show.add_argument("--full", action="store_true", help="Display full un-truncated content")
     map_show.add_argument("--max-tokens", type=int, default=None, help="Limit output to approximate token budget")
     map_show.add_argument("--json", action="store_true", help="Output in JSON format")
 
@@ -1939,6 +2070,9 @@ def main():
 
         res = get_project_state(args.path)
         sec_filter = getattr(args, "section", None)
+        is_compact = getattr(args, "compact", False)
+        is_outline = getattr(args, "outline", False)
+        is_full = getattr(args, "full", False)
         max_tokens = getattr(args, "max_tokens", None)
 
         if is_json:
@@ -1949,23 +2083,52 @@ def main():
                     res["content"] = sec_text
                 else:
                     res["error"] = f"Section '{sec_filter}' not found. Available: {', '.join(all_secs)}"
+            elif is_outline and "content" in res:
+                _, all_secs = extract_markdown_section(res["content"], "__all__")
+                res["outline"] = all_secs
             json_str = json.dumps({"status": "success" if "error" not in res else "error", "command": "state", "data": res}, indent=2)
             print(apply_token_budget(json_str, max_tokens))
         else:
             if "error" in res:
                 print(f"❌ {res['error']}")
+                if "suggestion" in res:
+                    print(f"💡 {res['suggestion']}")
             else:
-                title_kind = "PROJECT MAP" if res.get("type") == "project_map" else "PROJECT STATE"
+                p_type = res.get("type")
+                is_fallback = res.get("is_fallback", False)
+                title_kind = "PROJECT MAP" if p_type == "project_map" else ("PROJECT STATE" if p_type == "planning" else "PROJECT OVERVIEW")
                 resolved_info = f"📍 Resolved File: {res.get('resolved_file')} ({res.get('file_type', 'unknown')})"
-                header_text = f"\n🧭 {title_kind} ({res.get('project_path')}):\n{resolved_info}\n" + "="*60
+                
+                header_lines = [f"\n🧭 {title_kind} ({res.get('project_path')}):", resolved_info]
+                if is_fallback:
+                    idx_cnt = res.get('indexed_chunks', 0)
+                    idx_status = f"{idx_cnt} chunks" if idx_cnt > 0 else "0 chunks (Unindexed)"
+                    header_lines.append(f"📊 Central Brain Index: {idx_status}")
+                    header_lines.append("💡 Notice: No autonomous .agents/project_map.md or .planning/ tracking found.")
+                    header_lines.append(f"   Run 'brain map init {res.get('project_path')}' to scaffold an autonomous project map.")
+                header_text = "\n".join(header_lines) + "\n" + "="*60
 
                 body = res.get("content") or res.get("state") or res.get("project") or ""
-                if sec_filter:
+
+                if is_outline:
+                    _, all_secs = extract_markdown_section(body, "__all__")
+                    full_out = f"{header_text}\n\n📋 Markdown Sections in {Path(res.get('resolved_file', '')).name}:\n" + "\n".join([f"  • {s}" for s in all_secs]) + "\n"
+                elif sec_filter:
                     sec_text, all_secs = extract_markdown_section(body, sec_filter)
                     if sec_text:
                         full_out = f"{header_text}\n\n{sec_text}\n"
                     else:
                         full_out = f"{header_text}\n\n❌ Section '{sec_filter}' not found. Available sections:\n" + "\n".join([f"  • {s}" for s in all_secs]) + "\n"
+                elif is_compact:
+                    summary_text, all_secs = extract_project_doc_summary(body, max_overview_lines=8)
+                    full_out = f"{header_text}\n\n{summary_text}\n\n📋 Available Sections ({len(all_secs)} sections):\n" + "\n".join([f"  • {s}" for s in all_secs]) + f"\n\n💡 Tip: To inspect a section without context blowout, run:\n   brain state {res.get('project_path')} -s \"<SectionName>\"\n"
+                elif is_fallback and not is_full:
+                    # Fallback documentation view (e.g. README): optimize instead of dumping entire file
+                    summary_text, all_secs = extract_project_doc_summary(body, max_overview_lines=12)
+                    sec_list = "\n".join([f"  • {s}" for s in all_secs[:10]])
+                    if len(all_secs) > 10:
+                        sec_list += f"\n  ... and {len(all_secs) - 10} more sections"
+                    full_out = f"{header_text}\n\n{summary_text}\n\n📋 Available Sections in {Path(res.get('resolved_file', '')).name}:\n{sec_list}\n\n💡 Tip: View a specific section with: brain state {res.get('project_path')} -s \"<Section>\" (or pass --full to view entire file)\n"
                 else:
                     full_out = f"{header_text}\n\n{body}\n"
 
@@ -1999,8 +2162,8 @@ def main():
                 print()
 
         elif action == "add":
-            if not resolved_file:
-                err_msg = f"No active project map found to add entries into."
+            if not resolved_file or st.get("file_type") != "project_map":
+                err_msg = f"No active project map (.agents/project_map.md) found in {target_path or Path.cwd()}. Run 'brain map init' first."
                 if is_json:
                     print(json.dumps({"status": "error", "command": "map", "error": err_msg}, indent=2))
                 else:
@@ -2014,8 +2177,8 @@ def main():
                 print(f"{'✅' if ok else '❌'} {msg}")
 
         elif action == "set-section":
-            if not resolved_file:
-                err_msg = f"No active project map found."
+            if not resolved_file or st.get("file_type") != "project_map":
+                err_msg = f"No active project map (.agents/project_map.md) found in {target_path or Path.cwd()}. Run 'brain map init' first."
                 if is_json:
                     print(json.dumps({"status": "error", "command": "map", "error": err_msg}, indent=2))
                 else:
@@ -2037,21 +2200,42 @@ def main():
 
         else:
             # Default map view
+            is_compact = getattr(args, "compact", False)
+            is_outline = getattr(args, "outline", False)
+            is_full = getattr(args, "full", False)
             if is_json:
+                if sec_filter and "content" in st:
+                    sec_text, all_secs = extract_markdown_section(st["content"], sec_filter)
+                    if sec_text:
+                        st["section"] = sec_filter
+                        st["content"] = sec_text
+                    else:
+                        st["error"] = f"Section '{sec_filter}' not found. Available: {', '.join(all_secs)}"
+                elif is_outline and "content" in st:
+                    _, all_secs = extract_markdown_section(st["content"], "__all__")
+                    st["outline"] = all_secs
                 json_str = json.dumps({"status": "success" if "error" not in st else "error", "command": "map", "data": st}, indent=2)
                 print(apply_token_budget(json_str, max_tokens))
             else:
                 if "error" in st:
                     print(f"❌ {st['error']}")
+                    if "suggestion" in st:
+                        print(f"💡 {st['suggestion']}")
                 else:
                     header = f"\n🗺️ PROJECT MAP ({st.get('project_path')}):\n📍 Resolved File: {st.get('resolved_file')} ({st.get('file_type')})\n" + "="*60
                     body = st.get("content", "")
-                    if sec_filter:
+                    if is_outline:
+                        _, all_secs = extract_markdown_section(body, "__all__")
+                        full_out = f"{header}\n\n📋 Markdown Sections in {Path(st.get('resolved_file', '')).name}:\n" + "\n".join([f"  • {s}" for s in all_secs]) + "\n"
+                    elif sec_filter:
                         sec_text, all_secs = extract_markdown_section(body, sec_filter)
                         if sec_text:
                             full_out = f"{header}\n\n{sec_text}\n"
                         else:
                             full_out = f"{header}\n\n❌ Section '{sec_filter}' not found. Available sections:\n" + "\n".join([f"  • {s}" for s in all_secs]) + "\n"
+                    elif is_compact:
+                        summary_text, all_secs = extract_project_doc_summary(body, max_overview_lines=8)
+                        full_out = f"{header}\n\n{summary_text}\n\n📋 Available Sections ({len(all_secs)} sections):\n" + "\n".join([f"  • {s}" for s in all_secs]) + f"\n\n💡 Tip: To inspect a section without context blowout, run:\n   brain map show {st.get('project_path')} -s \"<SectionName>\"\n"
                     else:
                         full_out = f"{header}\n\n{body}\n"
                     print(apply_token_budget(full_out, max_tokens))
