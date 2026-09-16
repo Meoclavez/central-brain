@@ -31,13 +31,15 @@ from pathlib import Path
 from datetime import datetime
 
 # Base Directory Setup
-BRAIN_DIR = Path.home() / ".central_brain"
+BRAIN_DIR = Path(os.getenv("CENTRAL_BRAIN_DIR", os.getenv("BRAIN_DIR", Path.home() / ".central_brain"))).resolve()
 KNOWLEDGE_DIR = BRAIN_DIR / "knowledge"
 PROJECTS_DIR = BRAIN_DIR / "projects"
 EPISODES_DIR = BRAIN_DIR / "episodes"
 DB_DIR = BRAIN_DIR / "db"
 DB_PATH = DB_DIR / "brain.db"
 FACTS_PATH = BRAIN_DIR / "facts.json"
+SOURCES_PATH = BRAIN_DIR / "sources.json"
+SYSTEM_PROMPT_PATH = BRAIN_DIR / "SYSTEM_PROMPT.md"
 BACKUP_DIR = BRAIN_DIR / "backups"
 
 OLLAMA_EMBED_URL = "http://localhost:11434/api/embed"
@@ -50,6 +52,17 @@ def ensure_dirs():
     if not FACTS_PATH.exists():
         with open(FACTS_PATH, "w", encoding="utf-8") as f:
             json.dump([], f, indent=2)
+    if not SOURCES_PATH.exists():
+        default_sources = [
+            str(KNOWLEDGE_DIR),
+            str(PROJECTS_DIR),
+            str(EPISODES_DIR),
+            str(Path.home() / "Documents" / "Configs"),
+            str(Path.home() / ".agents" / "project_map.md"),
+            str(Path.home() / "AGENTS.md")
+        ]
+        with open(SOURCES_PATH, "w", encoding="utf-8") as f:
+            json.dump(default_sources, f, indent=2)
 
 def get_db():
     ensure_dirs()
@@ -360,17 +373,35 @@ def remember(fact: str, entity: str = "General", category: str = "Knowledge", so
     ingest_file(today_file)
     return True
 
-def forget(target: str, entity: str = None):
-    """Deletes matching facts, syncs facts.json, and records an invalidation log in today's episode file."""
+def forget(target: str = None, entity: str = None, fact_id: int = None):
+    """Deletes matching facts or a specific fact by ID, syncs facts.json, and records an invalidation log."""
     conn = get_db()
     deleted_count = 0
+    purged_info = ""
+
+    # Auto-detect numeric ID in target (e.g. '42' or '#42')
+    if fact_id is None and target:
+        m = re.match(r"^#?(\d+)$", str(target).strip())
+        if m:
+            fact_id = int(m.group(1))
+
     with conn:
-        if entity and entity != "General":
-            cur = conn.execute("DELETE FROM facts WHERE entity = ? AND (fact LIKE ? OR ? = '')", (entity, f"%{target}%", target))
+        if fact_id is not None:
+            row = conn.execute("SELECT id, entity, category, fact FROM facts WHERE id = ?", (fact_id,)).fetchone()
+            if row:
+                conn.execute("DELETE FROM facts WHERE id = ?", (fact_id,))
+                deleted_count = 1
+                purged_info = f"fact #{fact_id} [{row['category']}] ({row['entity']}): '{row['fact']}'"
+            else:
+                return 0
+        elif entity and entity != "General":
+            cur = conn.execute("DELETE FROM facts WHERE entity = ? AND (fact LIKE ? OR ? = '')", (entity, f"%{target}%", target or ""))
             deleted_count = cur.rowcount
+            purged_info = f"facts under entity '{entity}' matching '{target}'"
         else:
             cur = conn.execute("DELETE FROM facts WHERE fact LIKE ? OR entity LIKE ?", (f"%{target}%", f"%{target}%"))
             deleted_count = cur.rowcount
+            purged_info = f"facts matching '{target}'"
 
     sync_facts_json()
 
@@ -381,25 +412,49 @@ def forget(target: str, entity: str = None):
         if mode == "w":
             f.write(f"# Agent Episode Log - {today_str}\n\n")
         time_str = datetime.now().strftime("%H:%M:%S")
-        target_info = f"'{target}'" if target else f"entity '{entity}'"
-        f.write(f"- [{time_str}] **[Invalidated/Forgotten]** ({entity or 'General'}): Purged outdated/incorrect memory matching {target_info}\n")
+        f.write(f"- [{time_str}] **[Invalidated/Forgotten]** Purged {purged_info}\n")
 
     ingest_file(today_file)
     return deleted_count
 
-def correct(entity: str, new_fact: str, old_fact_search: str = None, category: str = "Fix", source: str = "CLI"):
-    """Corrects/supersedes an existing memory with a new finding."""
+def correct(entity: str = None, new_fact: str = None, old_fact_search: str = None, category: str = "Fix", source: str = "CLI", fact_id: int = None):
+    """Corrects/supersedes an existing memory with a new finding by ID or entity search."""
     conn = get_db()
+
+    # Auto-detect numeric ID in entity (e.g. `brain correct 42 "new fact"`)
+    if fact_id is None and entity:
+        m = re.match(r"^#?(\d+)$", str(entity).strip())
+        if m:
+            fact_id = int(m.group(1))
+
+    old_fact = None
+    use_entity = entity
+    use_cat = category
+
     with conn:
-        if old_fact_search:
+        if fact_id is not None:
+            row = conn.execute("SELECT id, entity, category, fact FROM facts WHERE id = ?", (fact_id,)).fetchone()
+            if not row:
+                return False
+            old_fact = row["fact"]
+            use_entity = entity if (entity and not re.match(r"^#?(\d+)$", str(entity).strip())) else row["entity"]
+            use_cat = category if category else row["category"]
+            conn.execute(
+                "UPDATE facts SET entity = ?, category = ?, fact = ?, source = ?, timestamp = CURRENT_TIMESTAMP WHERE id = ?",
+                (use_entity, use_cat, new_fact, source, fact_id)
+            )
+        elif old_fact_search:
             conn.execute("DELETE FROM facts WHERE entity = ? AND fact LIKE ?", (entity, f"%{old_fact_search}%"))
+            conn.execute(
+                "INSERT INTO facts (entity, category, fact, source) VALUES (?, ?, ?, ?)",
+                (entity, category, new_fact, source)
+            )
         else:
             conn.execute("DELETE FROM facts WHERE entity = ? AND category = ?", (entity, category))
-
-        conn.execute(
-            "INSERT INTO facts (entity, category, fact, source) VALUES (?, ?, ?, ?)",
-            (entity, category, new_fact, source)
-        )
+            conn.execute(
+                "INSERT INTO facts (entity, category, fact, source) VALUES (?, ?, ?, ?)",
+                (entity, category, new_fact, source)
+            )
 
     sync_facts_json()
 
@@ -410,7 +465,11 @@ def correct(entity: str, new_fact: str, old_fact_search: str = None, category: s
         if mode == "w":
             f.write(f"# Agent Episode Log - {today_str}\n\n")
         time_str = datetime.now().strftime("%H:%M:%S")
-        f.write(f"- [{time_str}] **[Correction]** ({entity}): {new_fact} (Supersedes prior finding, via {source})\n")
+        if fact_id is not None:
+            f.write(f"- [{time_str}] **[Correction]** ({use_entity}): Corrected fact #{fact_id}: '{new_fact}' (Supersedes: '{old_fact}')\n")
+        else:
+            old_info = f" (Supersedes: '{old_fact_search}')" if old_fact_search else ""
+            f.write(f"- [{time_str}] **[Correction]** ({entity}): {new_fact}{old_info}\n")
 
     ingest_file(today_file)
     return True
@@ -616,11 +675,10 @@ def init_project(project_name: str, target_dir: Path = None, description: str = 
 """, encoding="utf-8")
 
     # Register in sources.json
-    sources_file = BRAIN_DIR / "sources.json"
     sources = []
-    if sources_file.exists():
+    if SOURCES_PATH.exists():
         try:
-            with open(sources_file, "r", encoding="utf-8") as f:
+            with open(SOURCES_PATH, "r", encoding="utf-8") as f:
                 sources = json.load(f)
         except Exception:
             sources = []
@@ -628,7 +686,7 @@ def init_project(project_name: str, target_dir: Path = None, description: str = 
     str_plan = str(planning_dir)
     if str_plan not in sources:
         sources.append(str_plan)
-        with open(sources_file, "w", encoding="utf-8") as f:
+        with open(SOURCES_PATH, "w", encoding="utf-8") as f:
             json.dump(sources, f, indent=2)
 
     ingest_directory(planning_dir)
@@ -637,12 +695,13 @@ def init_project(project_name: str, target_dir: Path = None, description: str = 
     return True, f"Initialized .planning/ structure in {target_dir} and registered with Central Brain."
 
 def get_project_state(target_dir: Path = None) -> dict:
-    """Reads and parses .planning/STATE.md or PROJECT.md from a project directory."""
+    """Reads and parses .planning/STATE.md, PROJECT.md, or .agents/project_map.md with recursive fallback."""
     if not target_dir:
         target_dir = Path.cwd()
     else:
         target_dir = Path(target_dir).resolve()
 
+    # 1. Search upwards for .planning directory
     planning_dir = None
     curr = target_dir
     while curr != curr.parent:
@@ -651,33 +710,502 @@ def get_project_state(target_dir: Path = None) -> dict:
             break
         curr = curr.parent
 
-    if not planning_dir or not planning_dir.exists():
-        map_file = target_dir / ".agents" / "project_map.md"
-        if map_file.exists():
-            return {
-                "project_path": str(target_dir),
-                "type": "project_map",
-                "content": map_file.read_text(encoding="utf-8", errors="ignore")
-            }
-        return {"error": f"No .planning/ or .agents/project_map.md found in {target_dir} or parent directories."}
+    if planning_dir and planning_dir.exists():
+        state_file = planning_dir / "STATE.md"
+        project_file = planning_dir / "PROJECT.md"
+        roadmap_file = planning_dir / "ROADMAP.md"
 
-    res = {
-        "project_path": str(planning_dir.parent),
-        "planning_dir": str(planning_dir),
-        "files": [f.name for f in planning_dir.glob("*.md")]
+        resolved_file = state_file if state_file.exists() else (project_file if project_file.exists() else roadmap_file)
+        file_type = "planning_state" if (state_file.exists()) else "planning_project"
+
+        res = {
+            "project_path": str(planning_dir.parent),
+            "planning_dir": str(planning_dir),
+            "resolved_file": str(resolved_file) if resolved_file and resolved_file.exists() else None,
+            "file_type": file_type,
+            "type": "planning",
+            "files": [f.name for f in planning_dir.glob("*.md")]
+        }
+        if state_file.exists():
+            res["state"] = state_file.read_text(encoding="utf-8", errors="ignore")
+            res["content"] = res["state"]
+        if project_file.exists():
+            res["project"] = project_file.read_text(encoding="utf-8", errors="ignore")
+            if "content" not in res:
+                res["content"] = res["project"]
+        if roadmap_file.exists():
+            res["roadmap"] = roadmap_file.read_text(encoding="utf-8", errors="ignore")
+
+        return res
+
+    # 2. Search upwards for .agents/project_map.md
+    curr = target_dir
+    map_file = None
+    while curr != curr.parent:
+        candidate = curr / ".agents" / "project_map.md"
+        if candidate.is_file():
+            map_file = candidate
+            break
+        curr = curr.parent
+
+    # 3. Fallback to ~/.agents/project_map.md
+    if not map_file:
+        home_map = Path.home() / ".agents" / "project_map.md"
+        if home_map.is_file():
+            map_file = home_map
+
+    if map_file and map_file.exists():
+        content = map_file.read_text(encoding="utf-8", errors="ignore")
+        return {
+            "project_path": str(map_file.parent.parent if map_file.parent.name == ".agents" else map_file.parent),
+            "resolved_file": str(map_file),
+            "file_type": "project_map",
+            "type": "project_map",
+            "content": content
+        }
+
+    return {"error": f"No .planning/ or .agents/project_map.md found in {target_dir} or parent directories."}
+
+def extract_markdown_section(content: str, target_section: str) -> tuple[str | None, list[str]]:
+    """Extracts a specific markdown section (by title substring match) from a markdown document.
+    Returns (section_content, list_of_all_section_titles)."""
+    lines = content.splitlines()
+    in_code_block = False
+    sections = []
+
+    current_sec = None
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_code_block = not in_code_block
+            continue
+        if not in_code_block and stripped.startswith("#"):
+            m = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+            if m:
+                level = len(m.group(1))
+                title = m.group(2).strip()
+                if current_sec:
+                    current_sec["end"] = idx
+                    sections.append(current_sec)
+                current_sec = {"level": level, "title": title, "start": idx, "end": len(lines)}
+
+    if current_sec:
+        current_sec["end"] = len(lines)
+        sections.append(current_sec)
+
+    all_titles = [s["title"] for s in sections]
+    target_clean = re.sub(r"[^\w\s]", "", target_section).strip().lower()
+
+    matched_sec = None
+    for s in sections:
+        sec_clean = re.sub(r"[^\w\s]", "", s["title"]).strip().lower()
+        if target_clean in sec_clean or sec_clean in target_clean:
+            matched_sec = s
+            break
+
+    if not matched_sec:
+        return None, all_titles
+
+    start_idx = matched_sec["start"]
+    end_idx = len(lines)
+    for s in sections:
+        if s["start"] > start_idx and s["level"] <= matched_sec["level"]:
+            end_idx = s["start"]
+            break
+
+    section_lines = lines[start_idx:end_idx]
+    return "\n".join(section_lines).strip(), all_titles
+
+def apply_token_budget(text: str, max_tokens: int = None) -> str:
+    """Clamps output text to an approximate token budget (1 token ≈ 4 characters)."""
+    if not max_tokens or max_tokens <= 0:
+        return text
+    max_chars = max_tokens * 4
+    if len(text) <= max_chars:
+        return text
+
+    slice_point = text.rfind("\n", 0, max_chars)
+    if slice_point == -1 or slice_point < max_chars // 2:
+        slice_point = max_chars
+
+    return text[:slice_point] + f"\n\n[... output truncated: reached limit of --max-tokens {max_tokens} ...]"
+
+def atomic_write_file(path: Path, content: str):
+    """Atomically writes content to a file, creating a .bak backup."""
+    path = Path(path).resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        bak_file = path.with_suffix(path.suffix + ".bak")
+        try:
+            shutil.copy2(path, bak_file)
+        except Exception:
+            pass
+
+    tmp_file = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+    try:
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp_file, path)
+    finally:
+        if tmp_file.exists():
+            try:
+                tmp_file.unlink()
+            except Exception:
+                pass
+
+def map_add_entry(target_file: Path, section_name: str, entry: str) -> tuple[bool, str]:
+    """Appends an entry/bullet into a specific section of a markdown map or state file."""
+    target_file = Path(target_file).resolve()
+    if not target_file.exists():
+        return False, f"File {target_file} does not exist."
+
+    content = target_file.read_text(encoding="utf-8", errors="ignore")
+    lines = content.splitlines()
+
+    in_code_block = False
+    sections = []
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_code_block = not in_code_block
+            continue
+        if not in_code_block and stripped.startswith("#"):
+            m = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+            if m:
+                sections.append({"level": len(m.group(1)), "title": m.group(2).strip(), "idx": idx})
+
+    target_clean = re.sub(r"[^\w\s]", "", section_name).strip().lower()
+    matched = None
+    for s in sections:
+        sc = re.sub(r"[^\w\s]", "", s["title"]).strip().lower()
+        if target_clean in sc or sc in target_clean:
+            matched = s
+            break
+
+    if not matched:
+        available = [s["title"] for s in sections]
+        return False, f"Section '{section_name}' not found in {target_file}. Available: {', '.join(available)}"
+
+    insert_idx = len(lines)
+    for s in sections:
+        if s["idx"] > matched["idx"] and s["level"] <= matched["level"]:
+            insert_idx = s["idx"]
+            break
+
+    clean_entry = entry.strip()
+    if not clean_entry.startswith("-") and not clean_entry.startswith("*") and not clean_entry.startswith("1."):
+        clean_entry = f"- {clean_entry}"
+
+    lines.insert(insert_idx, clean_entry)
+    new_content = "\n".join(lines) + "\n"
+    atomic_write_file(target_file, new_content)
+    ingest_file(target_file)
+    return True, f"Added entry to '{matched['title']}' in {target_file}"
+
+def map_set_section(target_file: Path, section_name: str, new_body: str) -> tuple[bool, str]:
+    """Replaces the body of a markdown section with new content."""
+    target_file = Path(target_file).resolve()
+    if not target_file.exists():
+        return False, f"File {target_file} does not exist."
+
+    content = target_file.read_text(encoding="utf-8", errors="ignore")
+    lines = content.splitlines()
+
+    in_code_block = False
+    sections = []
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_code_block = not in_code_block
+            continue
+        if not in_code_block and stripped.startswith("#"):
+            m = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+            if m:
+                sections.append({"level": len(m.group(1)), "title": m.group(2).strip(), "idx": idx})
+
+    target_clean = re.sub(r"[^\w\s]", "", section_name).strip().lower()
+    matched = None
+    for s in sections:
+        sc = re.sub(r"[^\w\s]", "", s["title"]).strip().lower()
+        if target_clean in sc or sc in target_clean:
+            matched = s
+            break
+
+    if not matched:
+        available = [s["title"] for s in sections]
+        return False, f"Section '{section_name}' not found in {target_file}. Available: {', '.join(available)}"
+
+    end_idx = len(lines)
+    for s in sections:
+        if s["idx"] > matched["idx"] and s["level"] <= matched["level"]:
+            end_idx = s["idx"]
+            break
+
+    new_lines = lines[:matched["idx"] + 1] + [""] + new_body.strip().splitlines() + [""] + lines[end_idx:]
+    new_content = "\n".join(new_lines) + "\n"
+    atomic_write_file(target_file, new_content)
+    ingest_file(target_file)
+    return True, f"Updated section '{matched['title']}' in {target_file}"
+
+def init_project_map(target_dir: Path = None) -> tuple[bool, str]:
+    """Scaffolds a new .agents/project_map.md in the project directory."""
+    if not target_dir:
+        target_dir = Path.cwd()
+    else:
+        target_dir = Path(target_dir).resolve()
+
+    agents_dir = target_dir / ".agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    map_file = agents_dir / "project_map.md"
+
+    if map_file.exists():
+        return False, f"Project map already exists at {map_file}"
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    project_name = target_dir.name
+    content = f"""# Project Architecture & Component Map: {project_name}
+
+**Created:** {today_str}  
+**Root Directory:** `{target_dir}`
+
+## 🧭 System Overview
+- Brief high-level summary of {project_name} modules and goals.
+
+## 📦 Active Components & Services
+- Component 1: Initial core service.
+
+## ⚙️ Configuration & Key Paths
+- Key configuration files and their roles.
+
+## 📝 Recent Architectural Decisions
+- Initial project map established on {today_str}.
+"""
+    map_file.write_text(content, encoding="utf-8")
+    ingest_file(map_file)
+    remember(f"Scaffolded .agents/project_map.md in {target_dir}", entity=project_name, category="Project", source="CLI")
+    return True, f"Initialized .agents/project_map.md in {target_dir}"
+
+def state_update(target_dir: Path = None, phase: str = None, status: str = None) -> tuple[bool, str]:
+    """Updates active phase and/or status in .planning/STATE.md, auto-updating the timestamp."""
+    st = get_project_state(target_dir)
+    if "error" in st:
+        return False, st["error"]
+    resolved = st.get("resolved_file")
+    if not resolved or not resolved.endswith("STATE.md"):
+        return False, f"State file not found or target is not STATE.md ({resolved})"
+
+    state_path = Path(resolved)
+    content = state_path.read_text(encoding="utf-8", errors="ignore")
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    content = re.sub(r"\*\*Updated:\*\*.*", f"**Updated:** {today_str}", content)
+    if phase:
+        content = re.sub(r"\*\*Active Phase:\*\*.*", f"**Active Phase:** {phase}", content)
+    if status:
+        content = re.sub(r"\*\*Status:\*\*.*", f"**Status:** {status}", content)
+
+    atomic_write_file(state_path, content)
+    ingest_file(state_path)
+    return True, f"Updated state in {state_path} (Phase: {phase or 'Unchanged'}, Status: {status or 'Unchanged'})"
+
+def state_add_entry(target_dir: Path = None, entry_type: str = "action", text: str = "") -> tuple[bool, str]:
+    """Adds a decision, blocker, or action to .planning/STATE.md."""
+    st = get_project_state(target_dir)
+    if "error" in st:
+        return False, st["error"]
+    resolved = st.get("resolved_file")
+    if not resolved or not resolved.endswith("STATE.md"):
+        return False, f"State file not found or target is not STATE.md ({resolved})"
+
+    state_path = Path(resolved)
+    type_to_section = {
+        "action": "Next Actions",
+        "decision": "Recent Decisions",
+        "blocker": "Blockers / Risks"
+    }
+    sec_name = type_to_section.get(entry_type.lower(), entry_type)
+    ok, msg = map_add_entry(state_path, sec_name, text)
+    if ok:
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        c = state_path.read_text(encoding="utf-8", errors="ignore")
+        c = re.sub(r"\*\*Updated:\*\*.*", f"**Updated:** {today_str}", c)
+        atomic_write_file(state_path, c)
+        ingest_file(state_path)
+    return ok, msg
+
+def get_paths_info(target_dir: Path = None) -> dict:
+    """Returns a comprehensive, introspectable map of Central Brain paths, files, and active workspace state."""
+    ensure_dirs()
+    if not target_dir:
+        target_dir = Path.cwd()
+    else:
+        target_dir = Path(target_dir).resolve()
+
+    db_size = DB_PATH.stat().st_size if DB_PATH.exists() else 0
+    facts_size = FACTS_PATH.stat().st_size if FACTS_PATH.exists() else 0
+    prompt_size = SYSTEM_PROMPT_PATH.stat().st_size if SYSTEM_PROMPT_PATH.exists() else 0
+
+    sources_count = 0
+    if SOURCES_PATH.exists():
+        try:
+            with open(SOURCES_PATH, "r", encoding="utf-8") as f:
+                sources_count = len(json.load(f))
+        except Exception:
+            pass
+
+    facts_count = 0
+    if DB_PATH.exists():
+        try:
+            conn = get_db()
+            facts_count = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+        except Exception:
+            pass
+
+    project_state = get_project_state(target_dir)
+
+    return {
+        "brain_dir": {
+            "path": str(BRAIN_DIR),
+            "exists": BRAIN_DIR.exists()
+        },
+        "db_path": {
+            "path": str(DB_PATH),
+            "exists": DB_PATH.exists(),
+            "size_bytes": db_size,
+            "size_mb": round(db_size / (1024 * 1024), 2)
+        },
+        "facts_path": {
+            "path": str(FACTS_PATH),
+            "exists": FACTS_PATH.exists(),
+            "size_bytes": facts_size,
+            "fact_count": facts_count
+        },
+        "sources_path": {
+            "path": str(SOURCES_PATH),
+            "exists": SOURCES_PATH.exists(),
+            "sources_count": sources_count
+        },
+        "system_prompt_path": {
+            "path": str(SYSTEM_PROMPT_PATH),
+            "exists": SYSTEM_PROMPT_PATH.exists(),
+            "size_bytes": prompt_size
+        },
+        "knowledge_dir": {
+            "path": str(KNOWLEDGE_DIR),
+            "exists": KNOWLEDGE_DIR.exists(),
+            "files_count": len(list(KNOWLEDGE_DIR.glob("**/*.md"))) if KNOWLEDGE_DIR.exists() else 0
+        },
+        "projects_dir": {
+            "path": str(PROJECTS_DIR),
+            "exists": PROJECTS_DIR.exists(),
+            "files_count": len(list(PROJECTS_DIR.glob("**/*.md"))) if PROJECTS_DIR.exists() else 0
+        },
+        "episodes_dir": {
+            "path": str(EPISODES_DIR),
+            "exists": EPISODES_DIR.exists(),
+            "files_count": len(list(EPISODES_DIR.glob("*.md"))) if EPISODES_DIR.exists() else 0
+        },
+        "backups_dir": {
+            "path": str(BACKUP_DIR),
+            "exists": BACKUP_DIR.exists(),
+            "backups_count": len(list(BACKUP_DIR.glob("*.tar.gz"))) if BACKUP_DIR.exists() else 0
+        },
+        "workspace": {
+            "target_dir": str(target_dir),
+            "project_path": project_state.get("project_path"),
+            "resolved_file": project_state.get("resolved_file"),
+            "file_type": project_state.get("file_type"),
+            "has_planning": bool(project_state.get("planning_dir"))
+        }
     }
 
-    state_file = planning_dir / "STATE.md"
-    if state_file.exists():
-        res["state"] = state_file.read_text(encoding="utf-8", errors="ignore")
-    project_file = planning_dir / "PROJECT.md"
-    if project_file.exists():
-        res["project"] = project_file.read_text(encoding="utf-8", errors="ignore")
-    roadmap_file = planning_dir / "ROADMAP.md"
-    if roadmap_file.exists():
-        res["roadmap"] = roadmap_file.read_text(encoding="utf-8", errors="ignore")
+def generate_role_context(role: str = "general", target_dir: Path = None, max_tokens: int = 800) -> str:
+    """Generates a compact, role-tailored system prompt snippet for subagent context injection."""
+    role_norm = (role or "general").strip().lower()
+    st = get_project_state(target_dir)
 
-    return res
+    lines = [
+        f"# AGENT CONTEXT INJECTION: {role_norm.upper()}",
+        "",
+        "## 1. System Platform & Hardware Facts",
+        "- **OS:** Arch Linux (Rolling release).",
+        "- **Platform:** ASUS TUF Gaming A15 (FA506NFR) - AMD CPU + NVIDIA GPU.",
+        "- **Wi-Fi & Bluetooth:** MediaTek MT7921 802.11ax PCIe (`14c3:7961`, `mt7921e`) and USB Bluetooth (`13d3:3563`, driver `btusb` / `btmtk`). (Decommissioned Realtek RTL8852BE).",
+        "- **ACPI Sleep:** S0 (s2idle), S4, S5. (ACPI DSDT does NOT support S3 deep sleep).",
+        ""
+    ]
+
+    lines.append("## 2. Active Project Context")
+    if "error" not in st:
+        proj_path = st.get("project_path", "")
+        res_file = st.get("resolved_file", "")
+        f_type = st.get("file_type", "")
+        lines.append(f"- **Project Root:** {proj_path}")
+        lines.append(f"- **State Source:** {res_file} ({f_type})")
+        content = st.get("content", "")
+        phase_m = re.search(r"\*\*Active Phase:\*\*\s*([^\n]+)", content)
+        status_m = re.search(r"\*\*Status:\*\*\s*([^\n]+)", content)
+        if phase_m:
+            lines.append(f"- **Active Phase:** {phase_m.group(1).strip()}")
+        if status_m:
+            lines.append(f"- **Status:** {status_m.group(1).strip()}")
+    else:
+        lines.append("- **Status:** No active .planning/ or project_map.md detected.")
+    lines.append("")
+
+    conn = get_db()
+    facts = []
+    if role_norm in ["hardware", "system", "kernel", "audio", "wifi", "bluetooth"]:
+        facts = conn.execute("""
+            SELECT id, entity, category, fact FROM facts 
+            WHERE category IN ('Fix', 'Rule') 
+              AND (entity LIKE '%Bluetooth%' OR entity LIKE '%Wi-Fi%' OR entity LIKE '%Audio%' 
+                   OR entity LIKE '%PipeWire%' OR entity LIKE '%udev%' OR entity LIKE '%Hardware%'
+                   OR fact LIKE '%driver%' OR fact LIKE '%kernel%' OR fact LIKE '%udev%')
+            ORDER BY id DESC LIMIT 6
+        """).fetchall()
+    elif role_norm in ["frontend", "web", "ui", "browser"]:
+        facts = conn.execute("""
+            SELECT id, entity, category, fact FROM facts 
+            WHERE category IN ('Fix', 'Rule', 'Knowledge')
+              AND (entity LIKE '%Web%' OR entity LIKE '%Frontend%' OR fact LIKE '%Chrome%' 
+                   OR fact LIKE '%CSS%' OR fact LIKE '%DOM%' OR fact LIKE '%UI%')
+            ORDER BY id DESC LIMIT 6
+        """).fetchall()
+    elif role_norm in ["security", "audit"]:
+        facts = conn.execute("""
+            SELECT id, entity, category, fact FROM facts 
+            WHERE category IN ('Rule', 'Fix') 
+              AND (entity LIKE '%Security%' OR fact LIKE '%permission%' OR fact LIKE '%credential%'
+                   OR fact LIKE '%secret%' OR fact LIKE '%D-Bus%' OR fact LIKE '%policy%')
+            ORDER BY id DESC LIMIT 6
+        """).fetchall()
+    else:
+        facts = conn.execute("""
+            SELECT id, entity, category, fact FROM facts 
+            WHERE category IN ('Fix', 'Rule')
+            ORDER BY id DESC LIMIT 5
+        """).fetchall()
+
+    lines.append(f"## 3. Verified Rules & Fixes ({role_norm})")
+    if facts:
+        for f in facts:
+            lines.append(f"- [#{f['id']}] **[{f['category']}]** ({f['entity']}): {f['fact']}")
+    else:
+        lines.append("- No specific rules found. Query dynamically via `brain query`.")
+    lines.append("")
+
+    lines.extend([
+        "## 4. Execution Directives",
+        "- **Spec-Driven Loop:** DISCUSS -> PLAN -> EXECUTE -> VERIFY -> SHIP & REMEMBER.",
+        "- **Quality Gates:** Empirically verify all code and commands before completing tasks.",
+        "- **Memory Persistence:** When resolving issues, persist verified findings via:",
+        '  `brain remember "<fact>" --entity "<Topic>" --category "<Fix|Rule>"`',
+        ""
+    ])
+
+    raw_text = "\n".join(lines)
+    return apply_token_budget(raw_text, max_tokens)
 
 def clean_orphans():
     """Finds indexed files that no longer exist on disk and purges their chunks & FTS entries."""
@@ -754,9 +1282,8 @@ def backup_brain(output_path: Path = None, include_vault: bool = True) -> tuple[
 
         if FACTS_PATH.exists():
             shutil.copy2(FACTS_PATH, temp_snapshot_dir / "facts.json")
-        sources_file = BRAIN_DIR / "sources.json"
-        if sources_file.exists():
-            shutil.copy2(sources_file, temp_snapshot_dir / "sources.json")
+        if SOURCES_PATH.exists():
+            shutil.copy2(SOURCES_PATH, temp_snapshot_dir / "sources.json")
 
         if include_vault:
             for vdir in ["knowledge", "projects", "episodes"]:
@@ -807,7 +1334,7 @@ def restore_brain(backup_path: Path, force: bool = False) -> tuple[bool, str]:
         if (extract_tmp / "facts.json").exists():
             shutil.copy2(extract_tmp / "facts.json", FACTS_PATH)
         if (extract_tmp / "sources.json").exists():
-            shutil.copy2(extract_tmp / "sources.json", BRAIN_DIR / "sources.json")
+            shutil.copy2(extract_tmp / "sources.json", SOURCES_PATH)
 
         for vdir in ["knowledge", "projects", "episodes"]:
             src_v = extract_tmp / vdir
@@ -891,7 +1418,6 @@ def export_brain(output_file: Path = None, fmt: str = "markdown", category: str 
 
 def sync_brain():
     """Scans all registered directories/files and updates modified content in vector DB."""
-    sources_file = BRAIN_DIR / "sources.json"
     default_sources = [
         str(KNOWLEDGE_DIR),
         str(PROJECTS_DIR),
@@ -901,13 +1427,13 @@ def sync_brain():
         str(Path.home() / "AGENTS.md")
     ]
 
-    if not sources_file.exists():
-        with open(sources_file, "w", encoding="utf-8") as f:
+    if not SOURCES_PATH.exists():
+        with open(SOURCES_PATH, "w", encoding="utf-8") as f:
             json.dump(default_sources, f, indent=2)
         sources = default_sources
     else:
         try:
-            with open(sources_file, "r", encoding="utf-8") as f:
+            with open(SOURCES_PATH, "r", encoding="utf-8") as f:
                 sources = json.load(f)
         except Exception:
             sources = default_sources
@@ -984,7 +1510,7 @@ def run_mcp_server():
                     "result": {
                         "protocolVersion": "2024-11-05",
                         "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "central-brain", "version": "2.1.0"}
+                        "serverInfo": {"name": "central-brain", "version": "2.2.0"}
                     }
                 }
             elif method == "tools/list":
@@ -1002,7 +1528,8 @@ def run_mcp_server():
                                         "query": {"type": "string", "description": "Search query or problem description"},
                                         "top_k": {"type": "integer", "default": 5},
                                         "entity": {"type": "string", "description": "Optional entity filter"},
-                                        "category": {"type": "string", "description": "Optional category filter (Fix/Rule/Knowledge/Project)"}
+                                        "category": {"type": "string", "description": "Optional category filter (Fix/Rule/Knowledge/Project)"},
+                                        "compact": {"type": "boolean", "default": False, "description": "Token-efficient compact output format"}
                                     },
                                     "required": ["query"]
                                 }
@@ -1026,8 +1553,44 @@ def run_mcp_server():
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
-                                        "path": {"type": "string", "description": "Optional project path"}
+                                        "path": {"type": "string", "description": "Optional project path"},
+                                        "section": {"type": "string", "description": "Optional section name filter"}
                                     }
+                                }
+                            },
+                            {
+                                "name": "brain_info",
+                                "description": "Inspect all Central Brain system paths, files, databases, and active workspace resolution.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "path": {"type": "string", "description": "Optional workspace path"}
+                                    }
+                                }
+                            },
+                            {
+                                "name": "brain_inject",
+                                "description": "Generate a compact (<800 token) role-tailored system prompt snippet with verified hardware facts, rules, and project context for subagent initialization.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "role": {"type": "string", "enum": ["general", "system", "hardware", "frontend", "backend", "security"], "default": "general"},
+                                        "path": {"type": "string", "description": "Optional project path"},
+                                        "tokens": {"type": "integer", "default": 800}
+                                    }
+                                }
+                            },
+                            {
+                                "name": "brain_map_add",
+                                "description": "Append an entry to a specific section of the active project map (.agents/project_map.md or .planning/STATE.md).",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "section": {"type": "string", "description": "Section title"},
+                                        "entry": {"type": "string", "description": "Entry or bullet to append"},
+                                        "path": {"type": "string", "description": "Optional project path"}
+                                    },
+                                    "required": ["section", "entry"]
                                 }
                             },
                             {
@@ -1045,28 +1608,29 @@ def run_mcp_server():
                             },
                             {
                                 "name": "brain_forget",
-                                "description": "Remove wrong or outdated facts from the Central Brain.",
+                                "description": "Remove wrong or outdated facts from the Central Brain by search term or exact ID.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
-                                        "target": {"type": "string", "description": "Search term or keyword to delete"},
+                                        "target": {"type": "string", "description": "Search term, keyword, or fact ID"},
+                                        "id": {"type": "integer", "description": "Exact fact ID for precision deletion"},
                                         "entity": {"type": "string", "description": "Optional entity name"}
-                                    },
-                                    "required": ["target"]
+                                    }
                                 }
                             },
                             {
                                 "name": "brain_correct",
-                                "description": "Correct/supersede an existing memory or fact with a new finding.",
+                                "description": "Correct/supersede an existing memory or fact with a new finding by ID or entity.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
-                                        "entity": {"type": "string", "description": "Entity or topic to correct"},
                                         "new_fact": {"type": "string", "description": "The new corrected fact or solution"},
+                                        "id": {"type": "integer", "description": "Exact fact ID to update in-place"},
+                                        "entity": {"type": "string", "description": "Entity or topic to correct"},
                                         "old_fact_search": {"type": "string", "description": "Optional keyword of the old fact to replace"},
                                         "category": {"type": "string", "default": "Fix"}
                                     },
-                                    "required": ["entity", "new_fact"]
+                                    "required": ["new_fact"]
                                 }
                             },
                             {
@@ -1095,22 +1659,47 @@ def run_mcp_server():
 
                 if name == "brain_query":
                     res = search_brain(args.get("query"), args.get("top_k", 5), entity=args.get("entity"), category=args.get("category"))
+                    if args.get("compact"):
+                        compact_facts = [{"id": f["id"], "category": f["category"], "entity": f["entity"], "fact": f["fact"]} for f in res.get("facts", [])]
+                        compact_chunks = [{"file": Path(c["file_path"]).name, "header": c.get("header"), "snippet": c.get("content", "")[:120].strip()} for c in res.get("chunks", [])]
+                        res = {"facts": compact_facts, "chunks": compact_chunks}
                     resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": json.dumps(res, indent=2)}]}}
                 elif name == "brain_remember":
                     remember(args.get("fact"), args.get("entity", "General"), args.get("category", "Knowledge"), source="MCP")
                     resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": "Fact saved to Central Brain successfully."}]}}
                 elif name == "brain_state":
                     res = get_project_state(args.get("path"))
+                    if args.get("section") and "content" in res:
+                        sec_content, all_secs = extract_markdown_section(res["content"], args.get("section"))
+                        if sec_content:
+                            res["section"] = args.get("section")
+                            res["content"] = sec_content
+                        else:
+                            res["error"] = f"Section '{args.get('section')}' not found. Available: {', '.join(all_secs)}"
                     resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": json.dumps(res, indent=2)}]}}
+                elif name == "brain_info":
+                    res = get_paths_info(args.get("path"))
+                    resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": json.dumps(res, indent=2)}]}}
+                elif name == "brain_inject":
+                    ctx = generate_role_context(args.get("role", "general"), args.get("path"), args.get("tokens", 800))
+                    resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": ctx}]}}
+                elif name == "brain_map_add":
+                    st = get_project_state(args.get("path"))
+                    target_file = st.get("resolved_file")
+                    if target_file:
+                        ok, msg = map_add_entry(Path(target_file), args.get("section"), args.get("entry"))
+                    else:
+                        ok, msg = False, "No active project map or state file found."
+                    resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": msg}]}}
                 elif name == "brain_init_project":
                     ok, msg = init_project(args.get("name"), args.get("path"), args.get("description", ""))
                     resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": msg}]}}
                 elif name == "brain_forget":
-                    cnt = forget(args.get("target"), args.get("entity"))
-                    resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": f"Purged {cnt} matching facts from Central Brain."}]}}
+                    cnt = forget(args.get("target"), args.get("entity"), fact_id=args.get("id"))
+                    resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": f"Purged {cnt} matching fact(s) from Central Brain."}]}}
                 elif name == "brain_correct":
-                    correct(args.get("entity"), args.get("new_fact"), args.get("old_fact_search"), args.get("category", "Fix"), source="MCP")
-                    resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": f"Successfully corrected memory for entity '{args.get('entity')}'."}]}}
+                    ok = correct(args.get("entity"), args.get("new_fact"), args.get("old_fact_search"), args.get("category", "Fix"), source="MCP", fact_id=args.get("id"))
+                    resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": "Successfully corrected memory in Central Brain." if ok else "Failed to correct memory: fact not found."}]}}
                 elif name == "brain_export":
                     digest = export_brain(days=args.get("days", 30), category=args.get("category"))
                     resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": digest}]}}
@@ -1134,7 +1723,7 @@ def main():
     parser.add_argument("--json", action="store_true", help="Output all results in structured JSON format")
     sub = parser.add_subparsers(dest="command")
 
-    # query
+    # query / search
     q_p = sub.add_parser("query", aliases=["search"], help="Query the central brain")
     q_p.add_argument("text", type=str, help="Search query")
     q_p.add_argument("-k", "--top-k", type=int, default=5, help="Number of results")
@@ -1144,12 +1733,62 @@ def main():
     q_p.add_argument("--since", type=str, default=None, help="Filter since date (YYYY-MM-DD)")
     q_p.add_argument("--until", type=str, default=None, help="Filter until date (YYYY-MM-DD)")
     q_p.add_argument("-p", "--path", type=str, default=None, help="Filter by file path pattern")
+    q_p.add_argument("--compact", "--terse", action="store_true", dest="compact", help="Token-efficient single-line output mode")
+    q_p.add_argument("--max-tokens", type=int, default=None, help="Limit output to approximate token budget")
     q_p.add_argument("--json", action="store_true", help="Output in JSON format")
 
     # state / plan
-    st_cmd = sub.add_parser("state", aliases=["plan"], help="Inspect spec-driven project state (.planning/STATE.md)")
+    st_cmd = sub.add_parser("state", aliases=["plan"], help="Inspect or mutate spec-driven project state (.planning/STATE.md)")
     st_cmd.add_argument("path", nargs="?", default=None, help="Optional project directory")
+    st_cmd.add_argument("-s", "--section", type=str, default=None, help="Filter output to a specific section name")
+    st_cmd.add_argument("--max-tokens", type=int, default=None, help="Limit output to approximate token budget")
+    st_cmd.add_argument("--add", nargs=2, metavar=("TYPE", "TEXT"), help="Add an entry: --add <action|decision|blocker> '<text>'")
+    st_cmd.add_argument("--phase", type=str, default=None, help="Update active phase in STATE.md")
+    st_cmd.add_argument("--status", type=str, default=None, help="Update status in STATE.md")
     st_cmd.add_argument("--json", action="store_true", help="Output in JSON format")
+
+    # map
+    map_p = sub.add_parser("map", help="Inspect and mutate spec-driven project map (.agents/project_map.md)")
+    map_sub = map_p.add_subparsers(dest="map_action")
+
+    map_show = map_sub.add_parser("show", help="Display the active project map")
+    map_show.add_argument("path", nargs="?", default=None, help="Optional project directory")
+    map_show.add_argument("-s", "--section", type=str, default=None, help="Filter output to a specific section name")
+    map_show.add_argument("--max-tokens", type=int, default=None, help="Limit output to approximate token budget")
+    map_show.add_argument("--json", action="store_true", help="Output in JSON format")
+
+    map_ls = map_sub.add_parser("list-sections", help="List all markdown section headers in the active project map")
+    map_ls.add_argument("path", nargs="?", default=None, help="Optional project directory")
+    map_ls.add_argument("--json", action="store_true", help="Output in JSON format")
+
+    map_add = map_sub.add_parser("add", help="Append an entry to a specific section in the project map")
+    map_add.add_argument("section", type=str, help="Target section header name (e.g. 'Active System Rules')")
+    map_add.add_argument("entry", type=str, help="Bullet point or text entry to append")
+    map_add.add_argument("path", nargs="?", default=None, help="Optional project directory")
+    map_add.add_argument("--json", action="store_true", help="Output in JSON format")
+
+    map_set = map_sub.add_parser("set-section", help="Replace the body of a specific section in the project map")
+    map_set.add_argument("section", type=str, help="Target section header name")
+    map_set.add_argument("content", type=str, help="New body content for the section")
+    map_set.add_argument("path", nargs="?", default=None, help="Optional project directory")
+    map_set.add_argument("--json", action="store_true", help="Output in JSON format")
+
+    map_init_cmd = map_sub.add_parser("init", help="Scaffold a new .agents/project_map.md in the project directory")
+    map_init_cmd.add_argument("path", nargs="?", default=None, help="Target project directory (default: current dir)")
+    map_init_cmd.add_argument("--json", action="store_true", help="Output in JSON format")
+
+    # info / paths
+    info_p = sub.add_parser("info", aliases=["paths"], help="Display Central Brain paths, configuration introspection, and active workspace map")
+    info_p.add_argument("path", nargs="?", default=None, help="Optional workspace directory to inspect")
+    info_p.add_argument("--paths", action="store_true", help="Display paths and storage locations")
+    info_p.add_argument("--json", action="store_true", help="Output in JSON format")
+
+    # inject
+    inj_p = sub.add_parser("inject", help="Generate a compact, role-tailored system prompt snippet for subagent context injection")
+    inj_p.add_argument("role", nargs="?", default="general", choices=["general", "system", "hardware", "frontend", "web", "backend", "api", "security", "audit"], help="Target subagent role")
+    inj_p.add_argument("-p", "--path", type=str, default=None, help="Optional project directory")
+    inj_p.add_argument("-t", "--tokens", type=int, default=800, help="Maximum token budget for injected context (default: 800)")
+    inj_p.add_argument("--json", action="store_true", help="Output in JSON format")
 
     # init-project
     ip_cmd = sub.add_parser("init-project", help="Scaffold spec-driven .planning/ structure (PROJECT.md, ROADMAP.md, STATE.md)")
@@ -1168,14 +1807,16 @@ def main():
 
     # forget
     f_p = sub.add_parser("forget", help="Remove wrong or outdated memory from the central brain")
-    f_p.add_argument("target", type=str, help="Search term/phrase of the fact to remove")
+    f_p.add_argument("target", type=str, nargs="?", default=None, help="Search term/phrase of the fact to remove OR fact ID")
+    f_p.add_argument("--id", type=int, default=None, help="Deterministic deletion by exact fact ID")
     f_p.add_argument("-e", "--entity", type=str, default=None, help="Specific entity/topic filter")
     f_p.add_argument("--json", action="store_true", help="Output in JSON format")
 
     # correct
     c_p = sub.add_parser("correct", help="Correct/supersede a memory with a new finding")
-    c_p.add_argument("entity", type=str, help="Entity or topic name")
-    c_p.add_argument("new_fact", type=str, help="The new, corrected fact or solution")
+    c_p.add_argument("entity", type=str, nargs="?", default=None, help="Entity or topic name OR fact ID")
+    c_p.add_argument("new_fact", type=str, nargs="?", default=None, help="The new, corrected fact or solution")
+    c_p.add_argument("--id", type=int, default=None, help="Deterministic in-place update by exact fact ID")
     c_p.add_argument("-o", "--old", type=str, default=None, help="Old keyword or fact to replace")
     c_p.add_argument("-c", "--category", type=str, default="Fix", help="Category (Fix/Rule/Knowledge/Project)")
     c_p.add_argument("-s", "--source", type=str, default="CLI", help="Source agent/user")
@@ -1231,40 +1872,222 @@ def main():
             args.text, top_k=args.top_k, entity=args.entity, category=args.category,
             source=args.source, since=args.since, until=args.until, path_filter=args.path
         )
+        is_compact = getattr(args, "compact", False)
+        max_tokens = getattr(args, "max_tokens", None)
+
         if is_json:
-            print(json.dumps({"status": "success", "command": "query", "data": res, "timestamp": datetime.now().isoformat()}, indent=2))
+            out_data = res
+            if is_compact:
+                out_data = {
+                    "facts": [{"id": f["id"], "category": f["category"], "entity": f["entity"], "fact": f["fact"]} for f in res.get("facts", [])],
+                    "chunks": [{"file": Path(c["file_path"]).name, "header": c.get("header"), "snippet": c.get("content", "")[:120].strip()} for c in res.get("chunks", [])]
+                }
+            json_str = json.dumps({"status": "success", "command": "query", "data": out_data, "timestamp": datetime.now().isoformat()}, indent=2)
+            print(apply_token_budget(json_str, max_tokens))
         else:
-            print(f"\n🧠 CENTRAL BRAIN SEARCH RESULTS for: '{args.text}'\n" + "="*60)
-            if res["facts"]:
-                print("\n📌 RELEVANT FACTS:")
-                for f in res["facts"]:
-                    print(f"  • [{f['category']}] ({f['entity']}): {f['fact']} ({f['timestamp']})")
-            if res["chunks"]:
-                print("\n📄 RELEVANT KNOWLEDGE CHUNKS:")
-                for idx, c in enumerate(res["chunks"], 1):
-                    path_name = Path(c['file_path']).name
-                    print(f"\n--- Result #{idx} [Score: {c['score']}] | File: {path_name} ({c['header']}) ---")
-                    print(c['content'].strip()[:400] + ("..." if len(c['content']) > 400 else ""))
+            if is_compact:
+                lines = []
+                if res["facts"]:
+                    for f in res["facts"]:
+                        lines.append(f"[#{f['id']}] [{f['category']}] ({f['entity']}): {f['fact']}")
+                if res["chunks"]:
+                    for c in res["chunks"]:
+                        fname = Path(c['file_path']).name
+                        snippet = c['content'].replace("\n", " ").strip()[:100]
+                        lines.append(f"[Chunk] {fname} > {c['header']}: {snippet}...")
+                if not lines:
+                    lines.append("No matching facts or chunks found.")
+                print(apply_token_budget("\n".join(lines), max_tokens))
             else:
-                print("\nNo matching chunks found.")
-            print()
+                out_lines = [
+                    f"\n🧠 CENTRAL BRAIN SEARCH RESULTS for: '{args.text}'",
+                    "="*60
+                ]
+                if res["facts"]:
+                    out_lines.append("\n📌 RELEVANT FACTS:")
+                    for f in res["facts"]:
+                        out_lines.append(f"  • [#{f['id']}] [{f['category']}] ({f['entity']}): {f['fact']} ({f['timestamp']})")
+                if res["chunks"]:
+                    out_lines.append("\n📄 RELEVANT KNOWLEDGE CHUNKS:")
+                    for idx, c in enumerate(res["chunks"], 1):
+                        path_name = Path(c['file_path']).name
+                        out_lines.append(f"\n--- Result #{idx} [Score: {c['score']}] | File: {path_name} ({c['header']}) ---")
+                        out_lines.append(c['content'].strip()[:400] + ("..." if len(c['content']) > 400 else ""))
+                else:
+                    out_lines.append("\nNo matching chunks found.")
+                out_lines.append("")
+                print(apply_token_budget("\n".join(out_lines), max_tokens))
 
     elif args.command in ["state", "plan"]:
+        # Handle state mutations if flags passed
+        if getattr(args, "add", None):
+            entry_type, text = args.add
+            ok, msg = state_add_entry(args.path, entry_type, text)
+            if is_json:
+                print(json.dumps({"status": "success" if ok else "error", "command": "state", "action": "add", "data": {"message": msg}}, indent=2))
+            else:
+                print(f"{'✅' if ok else '❌'} {msg}")
+            return
+
+        if getattr(args, "phase", None) or getattr(args, "status", None):
+            ok, msg = state_update(args.path, phase=args.phase, status=args.status)
+            if is_json:
+                print(json.dumps({"status": "success" if ok else "error", "command": "state", "action": "update", "data": {"message": msg}}, indent=2))
+            else:
+                print(f"{'✅' if ok else '❌'} {msg}")
+            return
+
         res = get_project_state(args.path)
+        sec_filter = getattr(args, "section", None)
+        max_tokens = getattr(args, "max_tokens", None)
+
         if is_json:
-            print(json.dumps({"status": "success" if "error" not in res else "error", "command": "state", "data": res}, indent=2))
+            if sec_filter and "content" in res:
+                sec_text, all_secs = extract_markdown_section(res["content"], sec_filter)
+                if sec_text:
+                    res["section"] = sec_filter
+                    res["content"] = sec_text
+                else:
+                    res["error"] = f"Section '{sec_filter}' not found. Available: {', '.join(all_secs)}"
+            json_str = json.dumps({"status": "success" if "error" not in res else "error", "command": "state", "data": res}, indent=2)
+            print(apply_token_budget(json_str, max_tokens))
         else:
             if "error" in res:
                 print(f"❌ {res['error']}")
-            elif res.get("type") == "project_map":
-                print(f"\n🗺️ PROJECT MAP ({res['project_path']}):\n" + "="*50)
-                print(res["content"])
             else:
-                print(f"\n🧭 PROJECT STATE ({res['project_path']}):\n" + "="*50)
-                if "state" in res:
-                    print(res["state"])
-                elif "project" in res:
-                    print(res["project"])
+                title_kind = "PROJECT MAP" if res.get("type") == "project_map" else "PROJECT STATE"
+                resolved_info = f"📍 Resolved File: {res.get('resolved_file')} ({res.get('file_type', 'unknown')})"
+                header_text = f"\n🧭 {title_kind} ({res.get('project_path')}):\n{resolved_info}\n" + "="*60
+
+                body = res.get("content") or res.get("state") or res.get("project") or ""
+                if sec_filter:
+                    sec_text, all_secs = extract_markdown_section(body, sec_filter)
+                    if sec_text:
+                        full_out = f"{header_text}\n\n{sec_text}\n"
+                    else:
+                        full_out = f"{header_text}\n\n❌ Section '{sec_filter}' not found. Available sections:\n" + "\n".join([f"  • {s}" for s in all_secs]) + "\n"
+                else:
+                    full_out = f"{header_text}\n\n{body}\n"
+
+                print(apply_token_budget(full_out, max_tokens))
+
+    elif args.command == "map":
+        action = getattr(args, "map_action", None)
+        target_path = getattr(args, "path", None)
+        sec_filter = getattr(args, "section", None)
+        max_tokens = getattr(args, "max_tokens", None)
+
+        st = get_project_state(target_path)
+        resolved_file = st.get("resolved_file")
+
+        if action == "list-sections":
+            if not resolved_file or "content" not in st:
+                err_msg = f"No project map or state file found in {target_path or Path.cwd()}"
+                if is_json:
+                    print(json.dumps({"status": "error", "command": "map", "error": err_msg}, indent=2))
+                else:
+                    print(f"❌ {err_msg}")
+                return
+
+            _, all_secs = extract_markdown_section(st["content"], "__none__")
+            if is_json:
+                print(json.dumps({"status": "success", "command": "map", "action": "list-sections", "file": resolved_file, "sections": all_secs}, indent=2))
+            else:
+                print(f"\n📋 Markdown Sections in {resolved_file}:")
+                for s in all_secs:
+                    print(f"  • {s}")
+                print()
+
+        elif action == "add":
+            if not resolved_file:
+                err_msg = f"No active project map found to add entries into."
+                if is_json:
+                    print(json.dumps({"status": "error", "command": "map", "error": err_msg}, indent=2))
+                else:
+                    print(f"❌ {err_msg}")
+                return
+
+            ok, msg = map_add_entry(Path(resolved_file), args.section, args.entry)
+            if is_json:
+                print(json.dumps({"status": "success" if ok else "error", "command": "map", "action": "add", "data": {"message": msg, "file": resolved_file}}, indent=2))
+            else:
+                print(f"{'✅' if ok else '❌'} {msg}")
+
+        elif action == "set-section":
+            if not resolved_file:
+                err_msg = f"No active project map found."
+                if is_json:
+                    print(json.dumps({"status": "error", "command": "map", "error": err_msg}, indent=2))
+                else:
+                    print(f"❌ {err_msg}")
+                return
+
+            ok, msg = map_set_section(Path(resolved_file), args.section, args.content)
+            if is_json:
+                print(json.dumps({"status": "success" if ok else "error", "command": "map", "action": "set-section", "data": {"message": msg, "file": resolved_file}}, indent=2))
+            else:
+                print(f"{'✅' if ok else '❌'} {msg}")
+
+        elif action == "init":
+            ok, msg = init_project_map(target_path)
+            if is_json:
+                print(json.dumps({"status": "success" if ok else "error", "command": "map", "action": "init", "data": {"message": msg}}, indent=2))
+            else:
+                print(f"{'✅' if ok else '❌'} {msg}")
+
+        else:
+            # Default map view
+            if is_json:
+                json_str = json.dumps({"status": "success" if "error" not in st else "error", "command": "map", "data": st}, indent=2)
+                print(apply_token_budget(json_str, max_tokens))
+            else:
+                if "error" in st:
+                    print(f"❌ {st['error']}")
+                else:
+                    header = f"\n🗺️ PROJECT MAP ({st.get('project_path')}):\n📍 Resolved File: {st.get('resolved_file')} ({st.get('file_type')})\n" + "="*60
+                    body = st.get("content", "")
+                    if sec_filter:
+                        sec_text, all_secs = extract_markdown_section(body, sec_filter)
+                        if sec_text:
+                            full_out = f"{header}\n\n{sec_text}\n"
+                        else:
+                            full_out = f"{header}\n\n❌ Section '{sec_filter}' not found. Available sections:\n" + "\n".join([f"  • {s}" for s in all_secs]) + "\n"
+                    else:
+                        full_out = f"{header}\n\n{body}\n"
+                    print(apply_token_budget(full_out, max_tokens))
+
+    elif args.command in ["info", "paths"]:
+        paths_info = get_paths_info(args.path)
+        if is_json:
+            print(json.dumps({"status": "success", "command": "info", "data": paths_info, "timestamp": datetime.now().isoformat()}, indent=2))
+        else:
+            print("\n🧠 CENTRAL BRAIN PATH & SYSTEM INTROSPECTION")
+            print("="*65)
+            bd = paths_info["brain_dir"]
+            print(f"  • Base Directory:       {bd['path']:<35} [{'EXISTS' if bd['exists'] else 'MISSING'}]")
+            db = paths_info["db_path"]
+            print(f"  • SQLite Database:      {db['path']:<35} [{'EXISTS' if db['exists'] else 'MISSING'}] ({db.get('size_mb', 0)} MB)")
+            fp = paths_info["facts_path"]
+            print(f"  • Facts Registry:       {fp['path']:<35} [{'EXISTS' if fp['exists'] else 'MISSING'}] ({fp.get('fact_count', 0)} facts)")
+            sp = paths_info["sources_path"]
+            print(f"  • Sources Registry:     {sp['path']:<35} [{'EXISTS' if sp['exists'] else 'MISSING'}] ({sp.get('sources_count', 0)} sources)")
+            pr = paths_info["system_prompt_path"]
+            print(f"  • System Prompt:        {pr['path']:<35} [{'EXISTS' if pr['exists'] else 'MISSING'}] ({round(pr.get('size_bytes', 0)/1024, 1)} KB)")
+            bk = paths_info["backups_dir"]
+            print(f"  • Backups Directory:    {bk['path']:<35} [{'EXISTS' if bk['exists'] else 'MISSING'}] ({bk.get('backups_count', 0)} archives)")
+            print("\n  Active Workspace Context:")
+            ws = paths_info["workspace"]
+            print(f"  • Target Directory:     {ws.get('target_dir')}")
+            print(f"  • Resolved Project:     {ws.get('project_path') or 'None detected'}")
+            print(f"  • Resolved State File:  {ws.get('resolved_file') or 'None detected'} ({ws.get('file_type') or 'N/A'})")
+            print("="*65 + "\n")
+
+    elif args.command == "inject":
+        ctx = generate_role_context(args.role, args.path, args.tokens)
+        if is_json:
+            print(json.dumps({"status": "success", "command": "inject", "role": args.role, "context": ctx}, indent=2))
+        else:
+            print(ctx)
 
     elif args.command == "init-project":
         ok, msg = init_project(args.name, args.path, args.description)
@@ -1281,18 +2104,58 @@ def main():
             print(f"✅ Saved memory to Central Brain: [{args.category}] ({args.entity}): {args.fact}")
 
     elif args.command == "forget":
-        cnt = forget(args.target, args.entity)
+        fact_id = getattr(args, "id", None)
+        target = args.target
+        if fact_id is None and target and re.match(r"^#?(\d+)$", target.strip()):
+            fact_id = int(re.match(r"^#?(\d+)$", target.strip()).group(1))
+            target = None
+
+        cnt = forget(target, args.entity, fact_id=fact_id)
         if is_json:
-            print(json.dumps({"status": "success", "command": "forget", "data": {"purged_count": cnt, "target": args.target, "entity": args.entity}}, indent=2))
+            print(json.dumps({"status": "success", "command": "forget", "data": {"purged_count": cnt, "target": target, "id": fact_id, "entity": args.entity}}, indent=2))
         else:
-            print(f"🗑️ Central Brain: Purged {cnt} matching facts matching '{args.target}' (Entity: {args.entity or 'Any'}).")
+            if fact_id is not None:
+                if cnt > 0:
+                    print(f"🗑️ Central Brain: Purged fact #{fact_id}.")
+                else:
+                    print(f"❌ Central Brain: Fact #{fact_id} not found.")
+            else:
+                print(f"🗑️ Central Brain: Purged {cnt} matching fact(s) matching '{target}' (Entity: {args.entity or 'Any'}).")
 
     elif args.command == "correct":
-        correct(args.entity, args.new_fact, args.old, args.category, args.source)
+        fact_id = getattr(args, "id", None)
+        entity = args.entity
+        new_fact = args.new_fact
+
+        # Check for numeric entity argument: e.g. brain correct 42 "new fact"
+        if fact_id is None and entity and re.match(r"^#?(\d+)$", entity.strip()):
+            fact_id = int(re.match(r"^#?(\d+)$", entity.strip()).group(1))
+            entity = None
+
+        # If called as: brain correct --id 42 "new fact" (where new_fact is captured in entity)
+        if fact_id is not None and new_fact is None and entity is not None:
+            new_fact = entity
+            entity = None
+
+        if not new_fact:
+            err = "Error: A new corrected fact or solution must be provided."
+            if is_json:
+                print(json.dumps({"status": "error", "command": "correct", "error": err}, indent=2))
+            else:
+                print(f"❌ {err}")
+            return
+
+        ok = correct(entity, new_fact, args.old, args.category, args.source, fact_id=fact_id)
         if is_json:
-            print(json.dumps({"status": "success", "command": "correct", "data": {"entity": args.entity, "category": args.category, "new_fact": args.new_fact, "source": args.source}}, indent=2))
+            print(json.dumps({"status": "success" if ok else "error", "command": "correct", "data": {"entity": entity, "category": args.category, "new_fact": new_fact, "id": fact_id, "source": args.source}}, indent=2))
         else:
-            print(f"✨ Central Brain: Successfully corrected memory for [{args.category}] ({args.entity}) -> {args.new_fact}")
+            if ok:
+                if fact_id is not None:
+                    print(f"✨ Central Brain: Successfully updated fact #{fact_id} -> {new_fact}")
+                else:
+                    print(f"✨ Central Brain: Successfully corrected memory for [{args.category}] ({entity}) -> {new_fact}")
+            else:
+                print(f"❌ Central Brain: Could not correct memory (fact not found).")
 
     elif args.command == "ingest":
         p = Path(args.path).resolve()

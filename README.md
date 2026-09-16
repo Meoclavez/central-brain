@@ -68,23 +68,55 @@ brain status
 
 ### 1. Command Line Interface (`brain`)
 ```bash
-# Query the brain across all past projects & fixes
+# Transparent system paths & workspace introspection
+brain info --paths
+brain paths --json
+
+# Query the brain across all past projects & fixes (returns deterministic [#id])
 brain query "bluetooth autosuspend"
 
+# Token-efficient compact query mode (single-line facts & chunk citations)
+brain query "bluetooth" --compact
+brain query "bluetooth" --terse --max-tokens 300
+
 # Precision filtered query (category, entity, JSON output)
-brain query "bluetooth" -c "Fix" -e "Realtek RTL8852BE Bluetooth" --json
+brain query "bluetooth" -c "Fix" -e "MediaTek MT7921" --json
 
 # Remember a new decision or fix across sessions
-brain remember "Realtek Wi-Fi power save set to 2" --entity "Wi-Fi" --category "Fix"
+brain remember "MediaTek MT7921 Wi-Fi stable on kernel 7.1.5+" --entity "Wi-Fi" --category "Fix"
 
-# Correct/supersede an earlier finding with an updated solution
-brain correct "Wi-Fi" "Realtek Wi-Fi fix is setting rtw89 aspm disabled" --category "Fix"
+# Precision fact correction by deterministic fact ID (in-place update)
+brain correct --id 42 "MediaTek MT7921 Wi-Fi stable on kernel 7.1.5+"
+brain correct 42 "MediaTek MT7921 Wi-Fi stable on kernel 7.1.5+"
 
-# Erase an invalid, false, or obsolete memory completely
+# Erase an invalid, false, or obsolete memory by deterministic fact ID or search term
+brain forget --id 42
+brain forget 42
 brain forget "temporary false assumption" --entity "Wi-Fi"
 
-# Inspect spec-driven project state, active phase, and blockers (.planning/STATE.md)
-brain state [project_path] --json
+# Inspect spec-driven project state with resolved file path header
+brain state [project_path]
+
+# Sectional state filtering & token budget limiter (slashes context token consumption)
+brain state --section "System Hardware Status"
+brain state --section "Next Actions" --max-tokens 200
+
+# Mutate project state (.planning/STATE.md) without manual file rewrites
+brain state --add action "Empirically verify unit tests"
+brain state --add decision "Selected SQLite WAL mode"
+brain state --phase "Phase 2: Execution" --status "In Progress"
+
+# Project map inspection & mutation (.agents/project_map.md)
+brain map list-sections
+brain map add "Active System Rules" "- /etc/test.conf: custom rule"
+brain map show -s "Active System Rules"
+brain map init [project_path]
+
+# Subagent context injection (generates ready-to-inject <800 token system prompt)
+brain inject general
+brain inject hardware
+brain inject security --tokens 500
+brain inject --json
 
 # Scaffold a clean spec-driven .planning/ structure in a project
 brain init-project <name> [project_path] -d "Project description"
