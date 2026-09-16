@@ -12,9 +12,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Create directories
 mkdir -p "$BRAIN_DIR/knowledge" "$BRAIN_DIR/projects" "$BRAIN_DIR/episodes" "$BRAIN_DIR/db" "$BIN_DIR"
 
-# Copy brain engine
+# Copy brain engine and system prompt
 cp "$SCRIPT_DIR/brain.py" "$BRAIN_DIR/brain.py"
 chmod +x "$BRAIN_DIR/brain.py"
+cp "$SCRIPT_DIR/SYSTEM_PROMPT.md" "$BRAIN_DIR/SYSTEM_PROMPT.md"
+cp "$SCRIPT_DIR/README.md" "$BRAIN_DIR/README.md"
 
 # Symlink to PATH
 ln -sf "$BRAIN_DIR/brain.py" "$BIN_DIR/brain"
