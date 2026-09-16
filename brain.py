@@ -27,6 +27,9 @@ import argparse
 import urllib.request
 import urllib.error
 import re
+import subprocess
+import platform
+import difflib
 from pathlib import Path
 from datetime import datetime
 
@@ -120,6 +123,22 @@ def get_db():
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_facts_entity_cat ON facts(entity, category, timestamp);")
+
+        # Self-healing rehydration: If facts table is empty but facts.json has entries, restore them!
+        try:
+            cur = conn.execute("SELECT COUNT(*) FROM facts")
+            row = cur.fetchone()
+            if row and row[0] == 0 and FACTS_PATH.exists() and FACTS_PATH.stat().st_size > 10:
+                with open(FACTS_PATH, "r", encoding="utf-8") as f:
+                    cached_facts = json.load(f)
+                if cached_facts and isinstance(cached_facts, list):
+                    for item in cached_facts:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO facts (id, entity, category, fact, source, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+                            (item.get("id"), item.get("entity", "General"), item.get("category", "Knowledge"), item.get("fact", ""), item.get("source", "Restored"), item.get("timestamp", datetime.now().isoformat()))
+                        )
+        except Exception:
+            pass
     return conn
 
 def encode_vector_blob(vec: list[float]) -> bytes:
@@ -305,7 +324,9 @@ def ingest_file(file_path: Path):
     if existing and existing[0][0] > 0:
         first_hash = existing[0][1] or ""
         if first_hash.startswith(f"{file_content_hash}:"):
-            return existing[0][0]
+            null_embeds = conn.execute("SELECT COUNT(*) FROM chunks WHERE file_path = ? AND embedding IS NULL", (str_path,)).fetchone()[0]
+            if null_embeds == 0:
+                return existing[0][0]
 
     chunks = chunk_markdown(content, str_path)
     if not chunks:
@@ -343,10 +364,44 @@ def ingest_directory(dir_path: Path):
                 total += ingest_file(fp)
     return total
 
+def backfill_missing_embeddings(batch_size: int = EMBED_BATCH_SIZE) -> int:
+    """Finds chunks in SQLite with NULL embeddings and backfills them via Ollama."""
+    conn = get_db()
+    rows = conn.execute("SELECT id, header, content FROM chunks WHERE embedding IS NULL").fetchall()
+    if not rows:
+        return 0
+
+    # Verify Ollama is reachable before attempting
+    test_vec = get_embedding("test")
+    if not test_vec:
+        return 0
+
+    total_backfilled = 0
+    for i in range(0, len(rows), batch_size):
+        batch = rows[i:i + batch_size]
+        prepared_inputs = [f"{r['header'] or ''}\n{r['content']}" for r in batch]
+        vecs = get_embeddings_batch(prepared_inputs)
+        with conn:
+            for r, vec in zip(batch, vecs):
+                if vec:
+                    conn.execute("UPDATE chunks SET embedding = ? WHERE id = ?", (encode_vector_blob(vec), r["id"]))
+                    total_backfilled += 1
+    return total_backfilled
+
 def sync_facts_json():
     """Syncs the SQLite facts table into ~/.central_brain/facts.json for version control tracking."""
     conn = get_db()
     rows = conn.execute("SELECT id, entity, category, fact, source, timestamp FROM facts ORDER BY id ASC").fetchall()
+    # Safeguard against accidental data loss:
+    # If SQLite has 0 rows, but facts.json already has >0 facts, do NOT overwrite with an empty list!
+    if not rows and FACTS_PATH.exists() and FACTS_PATH.stat().st_size > 10:
+        try:
+            with open(FACTS_PATH, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            if cached and len(cached) > 0:
+                return
+        except Exception:
+            pass
     facts_list = [dict(r) for r in rows]
     with open(FACTS_PATH, "w", encoding="utf-8") as f:
         json.dump(facts_list, f, indent=2)
@@ -1139,8 +1194,193 @@ def state_add_entry(target_dir: Path = None, entry_type: str = "action", text: s
         ingest_file(state_path)
     return ok, msg
 
+def get_git_info(directory: Path) -> dict:
+    """Safely retrieves git repository status for a directory without external dependencies."""
+    if not directory or not directory.exists():
+        return {"is_git_repo": False}
+    try:
+        is_git = subprocess.run(
+            ["git", "-C", str(directory), "rev-parse", "--is-inside-work-tree"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=2
+        )
+        if is_git.returncode != 0 or is_git.stdout.strip() != "true":
+            return {"is_git_repo": False}
+
+        root_proc = subprocess.run(
+            ["git", "-C", str(directory), "rev-parse", "--show-toplevel"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=2
+        )
+        git_root = root_proc.stdout.strip() if root_proc.returncode == 0 else str(directory)
+
+        branch_proc = subprocess.run(
+            ["git", "-C", str(directory), "branch", "--show-current"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=2
+        )
+        branch = branch_proc.stdout.strip() if branch_proc.returncode == 0 else ""
+        if not branch:
+            head_proc = subprocess.run(
+                ["git", "-C", str(directory), "rev-parse", "--short", "HEAD"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=2
+            )
+            branch = f"HEAD ({head_proc.stdout.strip()})" if head_proc.returncode == 0 else "unknown"
+
+        status_proc = subprocess.run(
+            ["git", "-C", str(directory), "status", "--porcelain"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=3
+        )
+        status_lines = [l for l in status_proc.stdout.splitlines() if l.strip()] if status_proc.returncode == 0 else []
+
+        remote_proc = subprocess.run(
+            ["git", "-C", str(directory), "remote", "get-url", "origin"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=2
+        )
+        remote_url = remote_proc.stdout.strip() if remote_proc.returncode == 0 else None
+
+        log_proc = subprocess.run(
+            ["git", "-C", str(directory), "log", "-1", "--format=%h %s (%cr)"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=2
+        )
+        last_commit = log_proc.stdout.strip() if log_proc.returncode == 0 else None
+
+        return {
+            "is_git_repo": True,
+            "git_root": git_root,
+            "branch": branch,
+            "clean": len(status_lines) == 0,
+            "uncommitted_changes": len(status_lines),
+            "remote_url": remote_url,
+            "last_commit": last_commit
+        }
+    except Exception:
+        return {"is_git_repo": False}
+
+def detect_project_tech_stack(project_root: Path) -> list[str]:
+    """Detects tech stack, frameworks, and build tools in a project directory."""
+    if not project_root or not project_root.is_dir():
+        return []
+    stack = []
+
+    # 1. Node / Frontend / JS / TS
+    pkg_json = project_root / "package.json"
+    if pkg_json.exists():
+        try:
+            with open(pkg_json, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            deps = {**data.get("dependencies", {}), **data.get("devDependencies", {})}
+            if "next" in deps:
+                stack.append("Next.js")
+            elif "react" in deps:
+                stack.append("React")
+            if "vue" in deps:
+                stack.append("Vue")
+            if "svelte" in deps:
+                stack.append("Svelte")
+            if "astro" in deps:
+                stack.append("Astro")
+            if "vite" in deps:
+                stack.append("Vite")
+            if "tailwindcss" in deps:
+                stack.append("TailwindCSS")
+            if "electron" in deps:
+                stack.append("Electron")
+            if "typescript" in deps or (project_root / "tsconfig.json").exists():
+                stack.append("TypeScript")
+            elif not any("React" in s or "Next" in s or "Vue" in s for s in stack):
+                stack.append("Node.js")
+        except Exception:
+            stack.append("Node.js")
+    elif (project_root / "tsconfig.json").exists():
+        stack.append("TypeScript")
+
+    # 2. Python
+    pyproject = project_root / "pyproject.toml"
+    reqs = project_root / "requirements.txt"
+    if pyproject.exists() or reqs.exists() or (project_root / "setup.py").exists() or list(project_root.glob("*.py")):
+        py_label = "Python"
+        found_fw = []
+        text_to_check = ""
+        if pyproject.exists():
+            try:
+                text_to_check += pyproject.read_text(encoding="utf-8", errors="ignore").lower()
+            except Exception:
+                pass
+        if reqs.exists():
+            try:
+                text_to_check += reqs.read_text(encoding="utf-8", errors="ignore").lower()
+            except Exception:
+                pass
+        if "fastapi" in text_to_check:
+            found_fw.append("FastAPI")
+        if "django" in text_to_check:
+            found_fw.append("Django")
+        if "flask" in text_to_check:
+            found_fw.append("Flask")
+        if "torch" in text_to_check or "pytorch" in text_to_check:
+            found_fw.append("PyTorch")
+
+        if found_fw:
+            stack.append(f"{py_label} ({', '.join(found_fw)})")
+        else:
+            stack.append(py_label)
+
+    # 3. Rust
+    if (project_root / "Cargo.toml").exists():
+        if (project_root / "src-tauri").exists():
+            stack.append("Rust (Tauri)")
+        else:
+            stack.append("Rust")
+
+    # 4. Go
+    if (project_root / "go.mod").exists():
+        stack.append("Go")
+
+    # 5. Flutter / Dart
+    if (project_root / "pubspec.yaml").exists():
+        stack.append("Flutter / Dart")
+
+    # 6. C / C++ / Systems
+    if (project_root / "CMakeLists.txt").exists():
+        stack.append("C++ (CMake)")
+    elif (project_root / "Makefile").exists() and not any(x in stack for x in ["Node.js", "Python", "Rust", "Go"]):
+        stack.append("C / Make")
+
+    # 7. Containerization & Arch Linux
+    if (project_root / "Dockerfile").exists() or (project_root / "compose.yaml").exists() or (project_root / "docker-compose.yml").exists():
+        stack.append("Docker")
+    if (project_root / "PKGBUILD").exists():
+        stack.append("Arch PKGBUILD")
+
+    return stack
+
+def check_ollama_status() -> dict:
+    """Checks Ollama daemon connectivity, latency, and embed model availability."""
+    start_time = time.time()
+    try:
+        req = urllib.request.Request("http://localhost:11434/api/tags")
+        with urllib.request.urlopen(req, timeout=1.5) as resp:
+            latency_ms = round((time.time() - start_time) * 1000, 1)
+            data = json.loads(resp.read().decode("utf-8"))
+            models = [m.get("name", "") for m in data.get("models", [])]
+            has_model = any(DEFAULT_EMBED_MODEL in m for m in models)
+            return {
+                "online": True,
+                "latency_ms": latency_ms,
+                "models_count": len(models),
+                "embed_model": DEFAULT_EMBED_MODEL,
+                "embed_model_available": has_model,
+                "installed_models": models[:5]
+            }
+    except Exception as e:
+        return {
+            "online": False,
+            "latency_ms": None,
+            "embed_model": DEFAULT_EMBED_MODEL,
+            "embed_model_available": False,
+            "error": str(e)
+        }
+
 def get_paths_info(target_dir: Path = None) -> dict:
-    """Returns a comprehensive, introspectable map of Central Brain paths, files, and active workspace state."""
+    """Returns a comprehensive, introspectable map of Central Brain paths, storage, active workspace state, git, and toolchain."""
     ensure_dirs()
     if not target_dir:
         target_dir = Path.cwd()
@@ -1148,81 +1388,158 @@ def get_paths_info(target_dir: Path = None) -> dict:
         target_dir = Path(target_dir).resolve()
 
     db_size = DB_PATH.stat().st_size if DB_PATH.exists() else 0
+    wal_path = DB_PATH.with_suffix(".db-wal")
+    wal_size = wal_path.stat().st_size if wal_path.exists() else 0
     facts_size = FACTS_PATH.stat().st_size if FACTS_PATH.exists() else 0
     prompt_size = SYSTEM_PROMPT_PATH.stat().st_size if SYSTEM_PROMPT_PATH.exists() else 0
 
     sources_count = 0
+    registered_sources = []
     if SOURCES_PATH.exists():
         try:
             with open(SOURCES_PATH, "r", encoding="utf-8") as f:
-                sources_count = len(json.load(f))
+                registered_sources = json.load(f)
+                sources_count = len(registered_sources)
         except Exception:
             pass
 
     facts_count = 0
+    total_chunks = 0
     if DB_PATH.exists():
         try:
             conn = get_db()
             facts_count = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+            total_chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
         except Exception:
             pass
 
+    backups = list(BACKUP_DIR.glob("*.tar.gz")) if BACKUP_DIR.exists() else []
+    latest_backup = None
+    if backups:
+        newest = max(backups, key=lambda p: p.stat().st_mtime)
+        latest_backup = {
+            "filename": newest.name,
+            "size_mb": round(newest.stat().st_size / (1024 * 1024), 2),
+            "created_at": datetime.fromtimestamp(newest.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+        }
+
+    # Workspace Context
     project_state = get_project_state(target_dir)
+    project_root = Path(project_state.get("project_path")) if project_state.get("project_path") else (target_dir if (target_dir / ".git").exists() else None)
+    eval_dir = project_root if project_root else target_dir
+
+    git_info = get_git_info(eval_dir)
+    tech_stack = detect_project_tech_stack(eval_dir)
+
+    # Check registration in sources.json
+    is_registered_source = False
+    try:
+        check_paths = [eval_dir, eval_dir.resolve()]
+        for s in registered_sources:
+            sp = Path(s).resolve()
+            if any(cp == sp or cp.is_relative_to(sp) for cp in check_paths if sp.exists()):
+                is_registered_source = True
+                break
+    except Exception:
+        pass
+
+    # Chunks and facts for this workspace
+    workspace_chunks = 0
+    workspace_null_embeds = 0
+    workspace_facts = 0
+    if DB_PATH.exists():
+        try:
+            conn = get_db()
+            prefix = str(eval_dir.resolve()) + "%"
+            r1 = conn.execute("SELECT COUNT(*) FROM chunks WHERE file_path LIKE ?", (prefix,)).fetchone()
+            workspace_chunks = r1[0] if r1 else 0
+            r2 = conn.execute("SELECT COUNT(*) FROM chunks WHERE file_path LIKE ? AND embedding IS NULL", (prefix,)).fetchone()
+            workspace_null_embeds = r2[0] if r2 else 0
+
+            proj_name = eval_dir.name
+            r3 = conn.execute("SELECT COUNT(*) FROM facts WHERE entity LIKE ? OR source LIKE ? OR fact LIKE ?",
+                              (f"%{proj_name}%", f"%{proj_name}%", f"%{proj_name}%")).fetchone()
+            workspace_facts = r3[0] if r3 else 0
+        except Exception:
+            pass
+
+    # Toolchain
+    ollama_status = check_ollama_status()
+    toolchain_info = {
+        "ollama": ollama_status,
+        "sqlite_version": sqlite3.sqlite_version,
+        "python_version": platform.python_version(),
+        "os": "Arch Linux" if Path("/etc/arch-release").exists() else platform.system(),
+        "kernel": platform.release(),
+        "hostname": platform.node()
+    }
+
+    # Actionable Recommendations
+    recommendations = []
+    if not is_registered_source and project_root and project_root != Path.home():
+        recommendations.append(f"Workspace is not registered in Central Brain sources. To index, add its path to sources.json or run `brain ingest {project_root}`.")
+    if not project_state.get("resolved_file"):
+        recommendations.append(f"No project map or state file found. Run `brain map init {eval_dir}` or `brain init-project <name>`.")
+    elif project_state.get("file_type") == "documentation_fallback":
+        recommendations.append(f"Using {Path(project_state.get('resolved_file')).name} as fallback. Run `brain map init {eval_dir}` to create an official spec-driven map.")
+    if workspace_null_embeds > 0:
+        recommendations.append(f"{workspace_null_embeds} chunks in this workspace lack vector embeddings. Run `brain doctor --fix` to backfill.")
+    if not ollama_status.get("online"):
+        recommendations.append("Ollama daemon is offline. Start it ('systemctl --user start ollama' or 'ollama serve') for dense vector search.")
+    elif not ollama_status.get("embed_model_available"):
+        recommendations.append(f"Embedding model '{DEFAULT_EMBED_MODEL}' is missing. Run `ollama pull {DEFAULT_EMBED_MODEL}`.")
+    if git_info.get("is_git_repo") and not git_info.get("clean"):
+        recommendations.append(f"Workspace has {git_info.get('uncommitted_changes')} uncommitted git changes. Review before major refactoring.")
+
+    storage_info = {
+        "brain_dir": str(BRAIN_DIR),
+        "db_path": str(DB_PATH),
+        "db_size_bytes": db_size,
+        "db_size_mb": round(db_size / (1024 * 1024), 2),
+        "wal_size_bytes": wal_size,
+        "wal_size_mb": round(wal_size / (1024 * 1024), 2),
+        "facts_path": str(FACTS_PATH),
+        "facts_count": facts_count,
+        "sources_path": str(SOURCES_PATH),
+        "sources_count": sources_count,
+        "system_prompt_path": str(SYSTEM_PROMPT_PATH),
+        "backups_count": len(backups),
+        "latest_backup": latest_backup
+    }
 
     return {
-        "brain_dir": {
-            "path": str(BRAIN_DIR),
-            "exists": BRAIN_DIR.exists()
-        },
-        "db_path": {
-            "path": str(DB_PATH),
-            "exists": DB_PATH.exists(),
-            "size_bytes": db_size,
-            "size_mb": round(db_size / (1024 * 1024), 2)
-        },
-        "facts_path": {
-            "path": str(FACTS_PATH),
-            "exists": FACTS_PATH.exists(),
-            "size_bytes": facts_size,
-            "fact_count": facts_count
-        },
-        "sources_path": {
-            "path": str(SOURCES_PATH),
-            "exists": SOURCES_PATH.exists(),
-            "sources_count": sources_count
-        },
-        "system_prompt_path": {
-            "path": str(SYSTEM_PROMPT_PATH),
-            "exists": SYSTEM_PROMPT_PATH.exists(),
-            "size_bytes": prompt_size
-        },
-        "knowledge_dir": {
-            "path": str(KNOWLEDGE_DIR),
-            "exists": KNOWLEDGE_DIR.exists(),
-            "files_count": len(list(KNOWLEDGE_DIR.glob("**/*.md"))) if KNOWLEDGE_DIR.exists() else 0
-        },
-        "projects_dir": {
-            "path": str(PROJECTS_DIR),
-            "exists": PROJECTS_DIR.exists(),
-            "files_count": len(list(PROJECTS_DIR.glob("**/*.md"))) if PROJECTS_DIR.exists() else 0
-        },
-        "episodes_dir": {
-            "path": str(EPISODES_DIR),
-            "exists": EPISODES_DIR.exists(),
-            "files_count": len(list(EPISODES_DIR.glob("*.md"))) if EPISODES_DIR.exists() else 0
-        },
-        "backups_dir": {
-            "path": str(BACKUP_DIR),
-            "exists": BACKUP_DIR.exists(),
-            "backups_count": len(list(BACKUP_DIR.glob("*.tar.gz"))) if BACKUP_DIR.exists() else 0
-        },
+        # Backward compatibility with existing callers
+        "brain_dir": {"path": str(BRAIN_DIR), "exists": BRAIN_DIR.exists()},
+        "db_path": {"path": str(DB_PATH), "exists": DB_PATH.exists(), "size_bytes": db_size, "size_mb": round(db_size / (1024 * 1024), 2)},
+        "facts_path": {"path": str(FACTS_PATH), "exists": FACTS_PATH.exists(), "size_bytes": facts_size, "fact_count": facts_count},
+        "sources_path": {"path": str(SOURCES_PATH), "exists": SOURCES_PATH.exists(), "sources_count": sources_count},
+        "system_prompt_path": {"path": str(SYSTEM_PROMPT_PATH), "exists": SYSTEM_PROMPT_PATH.exists(), "size_bytes": prompt_size},
+        "knowledge_dir": {"path": str(KNOWLEDGE_DIR), "exists": KNOWLEDGE_DIR.exists(), "files_count": len(list(KNOWLEDGE_DIR.glob("**/*.md"))) if KNOWLEDGE_DIR.exists() else 0},
+        "projects_dir": {"path": str(PROJECTS_DIR), "exists": PROJECTS_DIR.exists(), "files_count": len(list(PROJECTS_DIR.glob("**/*.md"))) if PROJECTS_DIR.exists() else 0},
+        "episodes_dir": {"path": str(EPISODES_DIR), "exists": EPISODES_DIR.exists(), "files_count": len(list(EPISODES_DIR.glob("*.md"))) if EPISODES_DIR.exists() else 0},
+        "backups_dir": {"path": str(BACKUP_DIR), "exists": BACKUP_DIR.exists(), "backups_count": len(backups)},
         "workspace": {
             "target_dir": str(target_dir),
             "project_path": project_state.get("project_path"),
+            "project_root": str(eval_dir) if eval_dir else None,
             "resolved_file": project_state.get("resolved_file"),
             "file_type": project_state.get("file_type"),
             "has_planning": bool(project_state.get("planning_dir"))
-        }
+        },
+        # Enhanced Introspection Map
+        "storage": storage_info,
+        "git": git_info,
+        "tech_stack": tech_stack,
+        "central_brain_status": {
+            "is_registered_source": is_registered_source,
+            "workspace_chunks_count": workspace_chunks,
+            "workspace_null_embeddings": workspace_null_embeds,
+            "workspace_facts_count": workspace_facts,
+            "total_system_chunks": total_chunks,
+            "total_system_facts": facts_count
+        },
+        "toolchain": toolchain_info,
+        "recommendations": recommendations
     }
 
 def generate_role_context(role: str = "general", target_dir: Path = None, max_tokens: int = 800) -> str:
@@ -1586,8 +1903,9 @@ def sync_brain():
 
     orphan_files, orphan_chunks = clean_orphans()
     sync_facts_json()
+    backfilled_count = backfill_missing_embeddings()
 
-    return synced_paths, total_chunks, orphan_files, orphan_chunks
+    return synced_paths, total_chunks, orphan_files, orphan_chunks, backfilled_count
 
 def get_status():
     conn = get_db()
@@ -1613,6 +1931,293 @@ def get_status():
         "database_size_bytes": db_size,
         "database_size_mb": round(db_size / (1024 * 1024), 2)
     }
+
+def run_doctor(fix: bool = False) -> tuple[bool, dict]:
+    """Runs a 7-point health check across SQLite, Ollama, vector completeness, registries, and backups.
+    If fix is True, automatically repairs recoverable defects.
+    Returns (all_passed, results_dict).
+    """
+    ensure_dirs()
+    conn = get_db()
+    results = {
+        "sqlite_integrity": {"passed": False, "detail": ""},
+        "ollama_embed": {"passed": False, "detail": ""},
+        "facts_sync": {"passed": False, "detail": ""},
+        "vector_completeness": {"passed": False, "detail": ""},
+        "sources_health": {"passed": False, "detail": ""},
+        "fts5_index": {"passed": False, "detail": ""},
+        "backup_freshness": {"passed": False, "detail": ""}
+    }
+    fixes_applied = []
+
+    # 1. SQLite DB Integrity
+    try:
+        cur = conn.execute("PRAGMA integrity_check;")
+        row = cur.fetchone()
+        if row and row[0] == "ok":
+            db_size_mb = round(DB_PATH.stat().st_size / (1024 * 1024), 2) if DB_PATH.exists() else 0
+            results["sqlite_integrity"]["passed"] = True
+            results["sqlite_integrity"]["detail"] = f"Integrity check returned ok ({db_size_mb} MB)"
+        else:
+            err_msg = row[0] if row else "Unknown integrity error"
+            results["sqlite_integrity"]["passed"] = False
+            results["sqlite_integrity"]["detail"] = f"Integrity check failed: {err_msg}"
+            if fix:
+                conn.execute("VACUUM;")
+                fixes_applied.append("Ran VACUUM on database.")
+    except Exception as e:
+        results["sqlite_integrity"]["passed"] = False
+        results["sqlite_integrity"]["detail"] = f"Integrity check exception: {e}"
+
+    # 2. Ollama Embeddings Engine & Model
+    ollama_info = check_ollama_status()
+    if ollama_info.get("online"):
+        if ollama_info.get("embed_model_available"):
+            results["ollama_embed"]["passed"] = True
+            results["ollama_embed"]["detail"] = f"ONLINE ({ollama_info.get('latency_ms')} ms), '{DEFAULT_EMBED_MODEL}' ready"
+        else:
+            results["ollama_embed"]["passed"] = False
+            results["ollama_embed"]["detail"] = f"ONLINE ({ollama_info.get('latency_ms')} ms), but '{DEFAULT_EMBED_MODEL}' is missing"
+    else:
+        results["ollama_embed"]["passed"] = False
+        results["ollama_embed"]["detail"] = f"OFFLINE (Cannot reach {OLLAMA_EMBED_URL})"
+
+    # 3. Facts Table & facts.json Synchronization
+    try:
+        db_facts_count = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+        json_facts_count = 0
+        cached = []
+        if FACTS_PATH.exists():
+            with open(FACTS_PATH, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+                json_facts_count = len(cached) if isinstance(cached, list) else 0
+
+        if db_facts_count == json_facts_count and db_facts_count > 0:
+            results["facts_sync"]["passed"] = True
+            results["facts_sync"]["detail"] = f"In sync ({db_facts_count} SQLite rows == {json_facts_count} facts.json entries)"
+        elif db_facts_count == 0 and json_facts_count == 0:
+            results["facts_sync"]["passed"] = True
+            results["facts_sync"]["detail"] = "Empty (0 facts in SQLite or facts.json)"
+        else:
+            results["facts_sync"]["passed"] = False
+            results["facts_sync"]["detail"] = f"Mismatch: {db_facts_count} SQLite rows vs {json_facts_count} facts.json entries"
+            if fix:
+                if db_facts_count == 0 and json_facts_count > 0:
+                    for item in cached:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO facts (id, entity, category, fact, source, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+                            (item.get("id"), item.get("entity", "General"), item.get("category", "Knowledge"), item.get("fact", ""), item.get("source", "Restored"), item.get("timestamp", datetime.now().isoformat()))
+                        )
+                    fixes_applied.append(f"Rehydrated {json_facts_count} facts from facts.json into SQLite.")
+                else:
+                    sync_facts_json()
+                    fixes_applied.append("Synchronized SQLite facts into facts.json.")
+                results["facts_sync"]["passed"] = True
+    except Exception as e:
+        results["facts_sync"]["passed"] = False
+        results["facts_sync"]["detail"] = f"Sync check exception: {e}"
+
+    # 4. Vector Completeness
+    try:
+        total_chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        null_chunks = conn.execute("SELECT COUNT(*) FROM chunks WHERE embedding IS NULL").fetchone()[0]
+        if null_chunks == 0:
+            results["vector_completeness"]["passed"] = True
+            results["vector_completeness"]["detail"] = f"Complete ({total_chunks}/{total_chunks} chunks have embeddings)"
+        else:
+            results["vector_completeness"]["passed"] = False
+            results["vector_completeness"]["detail"] = f"{null_chunks} chunks missing embeddings ({total_chunks - null_chunks}/{total_chunks} embedded)"
+            if fix:
+                if ollama_info.get("online") and ollama_info.get("embed_model_available"):
+                    backfilled = backfill_missing_embeddings()
+                    if backfilled > 0:
+                        fixes_applied.append(f"Backfilled {backfilled} missing chunk embeddings via Ollama.")
+                        results["vector_completeness"]["passed"] = True
+                    else:
+                        fixes_applied.append("Attempted embedding backfill but 0 vectors were returned.")
+                else:
+                    fixes_applied.append("Cannot backfill embeddings: Ollama daemon or model is offline.")
+    except Exception as e:
+        results["vector_completeness"]["passed"] = False
+        results["vector_completeness"]["detail"] = f"Vector check exception: {e}"
+
+    # 5. Sources Registry Health
+    dead_sources = []
+    total_sources = 0
+    srcs = []
+    if SOURCES_PATH.exists():
+        try:
+            with open(SOURCES_PATH, "r", encoding="utf-8") as f:
+                srcs = json.load(f)
+            total_sources = len(srcs)
+            for s in srcs:
+                if not Path(s).exists():
+                    dead_sources.append(s)
+        except Exception:
+            pass
+
+    if not dead_sources:
+        results["sources_health"]["passed"] = True
+        results["sources_health"]["detail"] = f"All {total_sources} registered source paths exist on disk"
+    else:
+        results["sources_health"]["passed"] = False
+        results["sources_health"]["detail"] = f"{len(dead_sources)} dead source path(s) found"
+        if fix:
+            try:
+                valid_srcs = [s for s in srcs if s not in dead_sources]
+                with open(SOURCES_PATH, "w", encoding="utf-8") as f:
+                    json.dump(valid_srcs, f, indent=2)
+                clean_orphans()
+                fixes_applied.append(f"Pruned {len(dead_sources)} dead sources and cleaned orphan database chunks.")
+                results["sources_health"]["passed"] = True
+            except Exception as e:
+                fixes_applied.append(f"Failed pruning dead sources: {e}")
+
+    # 6. FTS5 Index Consistency
+    try:
+        conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('integrity-check');")
+        results["fts5_index"]["passed"] = True
+        results["fts5_index"]["detail"] = "chunks_fts virtual table consistent"
+    except Exception as e:
+        results["fts5_index"]["passed"] = False
+        results["fts5_index"]["detail"] = f"FTS5 integrity check failed: {e}"
+        if fix:
+            try:
+                conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild');")
+                fixes_applied.append("Rebuilt chunks_fts full-text index.")
+                results["fts5_index"]["passed"] = True
+            except Exception as e2:
+                fixes_applied.append(f"FTS5 rebuild failed: {e2}")
+
+    # 7. Backup Freshness (< 7 days)
+    backups = list(BACKUP_DIR.glob("*.tar.gz")) if BACKUP_DIR.exists() else []
+    if backups:
+        newest = max(backups, key=lambda p: p.stat().st_mtime)
+        age_days = round((time.time() - newest.stat().st_mtime) / (24 * 3600), 1)
+        if age_days <= 7.0:
+            results["backup_freshness"]["passed"] = True
+            results["backup_freshness"]["detail"] = f"Recent backup found: {newest.name} ({age_days} days ago)"
+        else:
+            results["backup_freshness"]["passed"] = False
+            results["backup_freshness"]["detail"] = f"Latest backup is stale: {newest.name} ({age_days} days ago)"
+            if fix:
+                ok, msg, _ = backup_brain()
+                if ok:
+                    fixes_applied.append("Created fresh transactional backup archive.")
+                    results["backup_freshness"]["passed"] = True
+    else:
+        results["backup_freshness"]["passed"] = False
+        results["backup_freshness"]["detail"] = "No backups found in backups directory"
+        if fix:
+            ok, msg, _ = backup_brain()
+            if ok:
+                fixes_applied.append("Created initial backup archive.")
+                results["backup_freshness"]["passed"] = True
+
+    all_passed = all(v["passed"] for v in results.values())
+    results["_meta"] = {
+        "all_passed": all_passed,
+        "fixes_applied": fixes_applied,
+        "timestamp": datetime.now().isoformat()
+    }
+    return all_passed, results
+
+def list_brain_items(kind: str = "facts", category: str = None, entity: str = None, limit: int = 25) -> tuple[str, list]:
+    """Lists facts, sources, discovered projects, or backups."""
+    ensure_dirs()
+    kind = (kind or "facts").lower().strip()
+
+    if kind in ["facts", "fact"]:
+        conn = get_db()
+        q = "SELECT id, entity, category, fact, timestamp FROM facts"
+        params = []
+        wheres = []
+        if category:
+            wheres.append("LOWER(category) = LOWER(?)")
+            params.append(category)
+        if entity:
+            wheres.append("LOWER(entity) = LOWER(?)")
+            params.append(entity)
+        if wheres:
+            q += " WHERE " + " AND ".join(wheres)
+        q += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        rows = conn.execute(q, params).fetchall()
+        items = [dict(r) for r in rows]
+        return "facts", items
+
+    elif kind in ["sources", "source"]:
+        items = []
+        if SOURCES_PATH.exists():
+            try:
+                with open(SOURCES_PATH, "r", encoding="utf-8") as f:
+                    src_list = json.load(f)
+                conn = get_db()
+                for s in src_list:
+                    p = Path(s)
+                    exists = p.exists()
+                    chunks_cnt = 0
+                    if exists:
+                        prefix = str(p.resolve()) + ("%" if p.is_dir() else "")
+                        row = conn.execute("SELECT COUNT(*) FROM chunks WHERE file_path LIKE ?", (prefix,)).fetchone()
+                        chunks_cnt = row[0] if row else 0
+                    items.append({
+                        "path": s,
+                        "exists": exists,
+                        "type": "directory" if p.is_dir() else ("file" if p.is_file() else "missing"),
+                        "indexed_chunks": chunks_cnt
+                    })
+            except Exception:
+                pass
+        return "sources", items
+
+    elif kind in ["projects", "project"]:
+        items = []
+        projects_base = Path.home() / "Projects"
+        search_dirs = [projects_base]
+        if PROJECTS_DIR.exists() and PROJECTS_DIR != projects_base:
+            search_dirs.append(PROJECTS_DIR)
+
+        visited = set()
+        for base in search_dirs:
+            if not base.exists():
+                continue
+            for item in sorted(base.iterdir()):
+                if item.is_dir() and not item.name.startswith("."):
+                    res_path = str(item.resolve())
+                    if res_path in visited:
+                        continue
+                    visited.add(res_path)
+                    st = get_project_state(item)
+                    stack = detect_project_tech_stack(item)
+                    git = get_git_info(item)
+                    items.append({
+                        "name": item.name,
+                        "path": res_path,
+                        "resolved_file": st.get("resolved_file"),
+                        "file_type": st.get("file_type"),
+                        "tech_stack": stack,
+                        "git_branch": git.get("branch") if git.get("is_git_repo") else None,
+                        "git_clean": git.get("clean") if git.get("is_git_repo") else None
+                    })
+        return "projects", items
+
+    elif kind in ["backups", "backup"]:
+        items = []
+        if BACKUP_DIR.exists():
+            for bk in sorted(BACKUP_DIR.glob("*.tar.gz"), key=lambda p: p.stat().st_mtime, reverse=True):
+                sz_mb = round(bk.stat().st_size / (1024 * 1024), 2)
+                mtime_str = datetime.fromtimestamp(bk.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+                items.append({
+                    "filename": bk.name,
+                    "path": str(bk),
+                    "size_mb": sz_mb,
+                    "created_at": mtime_str
+                })
+        return "backups", items
+
+    else:
+        return "error", [{"error": f"Unknown list type '{kind}'. Choose from 'facts', 'sources', 'projects', 'backups'."}]
 
 def run_mcp_server():
     """Runs a standard Model Context Protocol (MCP) JSON-RPC stdio server."""
@@ -1773,6 +2378,29 @@ def run_mcp_server():
                                 "name": "brain_status",
                                 "description": "Get current status and statistics of the Central Brain.",
                                 "inputSchema": {"type": "object", "properties": {}}
+                            },
+                            {
+                                "name": "brain_doctor",
+                                "description": "Run 7-point health check across SQLite, Ollama, vector completeness, registries, and backups, with optional auto-repair.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "fix": {"type": "boolean", "default": False, "description": "Automatically repair detected defects"}
+                                    }
+                                }
+                            },
+                            {
+                                "name": "brain_list",
+                                "description": "List facts, registered sources, discovered projects, or backups.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "kind": {"type": "string", "enum": ["facts", "sources", "projects", "backups"], "default": "facts"},
+                                        "category": {"type": "string", "description": "Filter facts by category"},
+                                        "entity": {"type": "string", "description": "Filter facts by entity"},
+                                        "limit": {"type": "integer", "default": 25}
+                                    }
+                                }
                             }
                         ]
                     }
@@ -1831,6 +2459,12 @@ def run_mcp_server():
                 elif name == "brain_status":
                     res = get_status()
                     resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": json.dumps(res, indent=2)}]}}
+                elif name == "brain_doctor":
+                    passed, res = run_doctor(fix=args.get("fix", False))
+                    resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": json.dumps(res, indent=2)}]}}
+                elif name == "brain_list":
+                    kind, items = list_brain_items(args.get("kind", "facts"), args.get("category"), args.get("entity"), args.get("limit", 25))
+                    resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": json.dumps({"kind": kind, "items": items}, indent=2)}]}}
                 else:
                     resp = {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Tool '{name}' not found"}}
             else:
@@ -1843,8 +2477,59 @@ def run_mcp_server():
             sys.stdout.write(json.dumps(err_resp) + "\n")
             sys.stdout.flush()
 
+class BrainArgumentParser(argparse.ArgumentParser):
+    """ArgumentParser with fuzzy command suggestions and rich formatted help."""
+    def error(self, message):
+        if "invalid choice: " in message:
+            match = re.search(r"invalid choice: '([^']+)'", message)
+            if match:
+                bad_choice = match.group(1)
+                subparsers_actions = [
+                    action for action in self._actions 
+                    if isinstance(action, argparse._SubParsersAction)
+                ]
+                valid_choices = []
+                for subaction in subparsers_actions:
+                    valid_choices.extend(subaction.choices.keys())
+
+                matches = difflib.get_close_matches(bad_choice, valid_choices, n=3, cutoff=0.5)
+                sys.stderr.write(f"\n❌ Error: Unknown command '{bad_choice}'.\n")
+                if matches:
+                    sys.stderr.write(f"💡 Did you mean: {', '.join([repr(m) for m in matches])}?\n")
+                sys.stderr.write("\nRun 'brain --help' to see all available commands.\n\n")
+                sys.exit(2)
+        super().error(message)
+
 def main():
-    parser = argparse.ArgumentParser(description="Central Brain - Unified Local Agent Memory & State CLI")
+    epilog_text = """
+Examples:
+  # Introspection & Diagnostics
+  brain info                      Inspect paths, active workspace, Git status, and toolchain
+  brain info /path/to/project     Inspect a specific project workspace
+  brain doctor                    Run 7-point health check across SQLite, Ollama, and registries
+  brain doctor --fix              Automatically self-heal missing vectors, dead sources, and FTS5
+
+  # Dynamic Memory & Search
+  brain query "mt7921 bluetooth"  Query verified facts & indexed documents
+  brain query "audio" --compact   Token-efficient 1-line facts with [#id]
+  brain remember "rule" -c Rule   Save verified solution or rule
+  brain list facts                List recent facts with IDs and categories
+  brain correct --id 42 "new"     In-place deterministic update by ID
+  brain forget --id 42            Deterministic deletion by ID
+
+  # Project State & Architecture Map
+  brain state                     Show resolved project state or documentation summary
+  brain state -s "Decisions"      Inspect a specific section without context blowout
+  brain state --add action "task" Add action item to active STATE.md
+  brain map show                  Display active project map (.agents/project_map.md)
+  brain map add "Rules" "- rule"  Append rule to project map section
+  brain inject hardware           Generate verified context prompt for subagents (<800 tokens)
+"""
+    parser = BrainArgumentParser(
+        description="Central Brain - Unified Local Agent Memory & State CLI",
+        epilog=epilog_text,
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--json", action="store_true", help="Output all results in structured JSON format")
     sub = parser.add_subparsers(dest="command")
 
@@ -1913,6 +2598,19 @@ def main():
     info_p.add_argument("path", nargs="?", default=None, help="Optional workspace directory to inspect")
     info_p.add_argument("--paths", action="store_true", help="Display paths and storage locations")
     info_p.add_argument("--json", action="store_true", help="Output in JSON format")
+
+    # doctor / repair
+    doc_p = sub.add_parser("doctor", aliases=["repair"], help="Run 7-point health check and self-heal Central Brain systems")
+    doc_p.add_argument("--fix", action="store_true", help="Automatically repair detected issues (backfill embeddings, sync facts, prune dead sources, rebuild FTS5)")
+    doc_p.add_argument("--json", action="store_true", help="Output diagnostic results in JSON format")
+
+    # list / ls
+    list_p = sub.add_parser("list", aliases=["ls"], help="List facts, registered sources, discovered projects, or backups")
+    list_p.add_argument("kind", nargs="?", default="facts", choices=["facts", "sources", "projects", "backups"], help="Type of items to list (default: facts)")
+    list_p.add_argument("-c", "--category", type=str, default=None, help="Filter facts by category")
+    list_p.add_argument("-e", "--entity", type=str, default=None, help="Filter facts by entity")
+    list_p.add_argument("-l", "--limit", type=int, default=25, help="Maximum number of items to display (default: 25)")
+    list_p.add_argument("--json", action="store_true", help="Output in JSON format")
 
     # inject
     inj_p = sub.add_parser("inject", help="Generate a compact, role-tailored system prompt snippet for subagent context injection")
@@ -2245,26 +2943,126 @@ def main():
         if is_json:
             print(json.dumps({"status": "success", "command": "info", "data": paths_info, "timestamp": datetime.now().isoformat()}, indent=2))
         else:
-            print("\n🧠 CENTRAL BRAIN PATH & SYSTEM INTROSPECTION")
-            print("="*65)
+            print("\n🧠 CENTRAL BRAIN & WORKSPACE INTROSPECTION")
+            print("="*68)
+            print("📁 Storage & Registries:")
             bd = paths_info["brain_dir"]
-            print(f"  • Base Directory:       {bd['path']:<35} [{'EXISTS' if bd['exists'] else 'MISSING'}]")
+            print(f"  • Base Directory:       {bd['path']:<38} [{'EXISTS' if bd['exists'] else 'MISSING'}]")
             db = paths_info["db_path"]
-            print(f"  • SQLite Database:      {db['path']:<35} [{'EXISTS' if db['exists'] else 'MISSING'}] ({db.get('size_mb', 0)} MB)")
+            wal_mb = paths_info.get("storage", {}).get("wal_size_mb", 0)
+            print(f"  • SQLite Database:      {db['path']:<38} [{'EXISTS' if db['exists'] else 'MISSING'}] ({db.get('size_mb', 0)} MB, WAL: {wal_mb} MB)")
             fp = paths_info["facts_path"]
-            print(f"  • Facts Registry:       {fp['path']:<35} [{'EXISTS' if fp['exists'] else 'MISSING'}] ({fp.get('fact_count', 0)} facts)")
+            print(f"  • Facts Registry:       {fp['path']:<38} [{'EXISTS' if fp['exists'] else 'MISSING'}] ({fp.get('fact_count', 0)} facts)")
             sp = paths_info["sources_path"]
-            print(f"  • Sources Registry:     {sp['path']:<35} [{'EXISTS' if sp['exists'] else 'MISSING'}] ({sp.get('sources_count', 0)} sources)")
-            pr = paths_info["system_prompt_path"]
-            print(f"  • System Prompt:        {pr['path']:<35} [{'EXISTS' if pr['exists'] else 'MISSING'}] ({round(pr.get('size_bytes', 0)/1024, 1)} KB)")
+            print(f"  • Sources Registry:     {sp['path']:<38} [{'EXISTS' if sp['exists'] else 'MISSING'}] ({sp.get('sources_count', 0)} sources)")
             bk = paths_info["backups_dir"]
-            print(f"  • Backups Directory:    {bk['path']:<35} [{'EXISTS' if bk['exists'] else 'MISSING'}] ({bk.get('backups_count', 0)} archives)")
-            print("\n  Active Workspace Context:")
+            print(f"  • Backups Directory:    {bk['path']:<38} [{'EXISTS' if bk['exists'] else 'MISSING'}] ({bk.get('backups_count', 0)} archives)")
+
+            print("\n📍 Active Workspace Context:")
             ws = paths_info["workspace"]
             print(f"  • Target Directory:     {ws.get('target_dir')}")
-            print(f"  • Resolved Project:     {ws.get('project_path') or 'None detected'}")
-            print(f"  • Resolved State File:  {ws.get('resolved_file') or 'None detected'} ({ws.get('file_type') or 'N/A'})")
-            print("="*65 + "\n")
+            print(f"  • Project Root:         {ws.get('project_root') or 'None detected'}")
+            tech = paths_info.get("tech_stack", [])
+            print(f"  • Tech Stack:           {', '.join(tech) if tech else 'None detected'}")
+            git = paths_info.get("git", {})
+            if git.get("is_git_repo"):
+                git_status_str = f"{git.get('branch')} ({'clean' if git.get('clean') else f'{git.get('uncommitted_changes')} uncommitted changes'})"
+                print(f"  • Git Repository:       {git_status_str}")
+                if git.get("last_commit"):
+                    print(f"    Last Commit:          {git.get('last_commit')}")
+                if git.get("remote_url"):
+                    print(f"    Remote URL:           {git.get('remote_url')}")
+            else:
+                print(f"  • Git Repository:       Not a git repository")
+            print(f"  • State File:           {ws.get('resolved_file') or 'None detected'} ({ws.get('file_type') or 'N/A'})")
+            cb = paths_info.get("central_brain_status", {})
+            reg_status = "Registered in sources" if cb.get("is_registered_source") else "Not registered in sources"
+            print(f"  • Central Brain Status: {reg_status} ({cb.get('workspace_chunks_count', 0)} chunks indexed, {cb.get('workspace_null_embeddings', 0)} missing embeddings)")
+
+            print("\n⚡ Toolchain & Services:")
+            tc = paths_info.get("toolchain", {})
+            ol = tc.get("ollama", {})
+            ol_str = f"ONLINE ({ol.get('latency_ms')} ms) | Model: {ol.get('embed_model')} [{'READY' if ol.get('embed_model_available') else 'MISSING'}]" if ol.get("online") else "OFFLINE"
+            print(f"  • Ollama Daemon:        {ol_str}")
+            print(f"  • Python / SQLite:      {tc.get('python_version')} / {tc.get('sqlite_version')}")
+            print(f"  • Host OS / Kernel:     {tc.get('os')} ({tc.get('kernel')}) on {tc.get('hostname')}")
+
+            recs = paths_info.get("recommendations", [])
+            if recs:
+                print("\n💡 Actionable Recommendations:")
+                for r in recs:
+                    print(f"  • {r}")
+            print("="*68 + "\n")
+
+    elif args.command in ["doctor", "repair"]:
+        all_passed, results = run_doctor(fix=getattr(args, "fix", False) or args.command == "repair")
+        if is_json:
+            print(json.dumps({"status": "success" if all_passed else "warning", "command": "doctor", "data": results}, indent=2))
+        else:
+            print("\n🩺 CENTRAL BRAIN HEALTH DIAGNOSTICS (7 Quality Gates)")
+            print("="*68)
+            gate_names = {
+                "sqlite_integrity": "SQLite DB Integrity",
+                "ollama_embed": "Ollama Embedding Engine",
+                "facts_sync": "Facts Registry Sync",
+                "vector_completeness": "Vector Embeddings",
+                "sources_health": "Sources Registry Health",
+                "fts5_index": "Full-Text Search (FTS5)",
+                "backup_freshness": "Backup Freshness"
+            }
+            for k, name in gate_names.items():
+                gate = results.get(k, {})
+                status_badge = "[PASS]" if gate.get("passed") else "[FAIL]"
+                print(f"  {status_badge:<8} {name:<26} {gate.get('detail', '')}")
+            print("="*68)
+            fixes = results.get("_meta", {}).get("fixes_applied", [])
+            if fixes:
+                print("🔧 Fixes Applied:")
+                for fx in fixes:
+                    print(f"  ✨ {fx}")
+                print("="*68)
+
+            if all_passed:
+                print("✅ All health checks passed! Central Brain is in optimal state.\n")
+            else:
+                if not getattr(args, "fix", False) and args.command != "repair":
+                    print("⚠️  Issues detected. Run `brain doctor --fix` (or `brain repair`) to auto-repair.\n")
+                else:
+                    print("⚠️  Some issues could not be resolved automatically. Review details above.\n")
+
+    elif args.command in ["list", "ls"]:
+        kind, items = list_brain_items(args.kind, args.category, args.entity, args.limit)
+        if is_json:
+            print(json.dumps({"status": "success", "command": "list", "kind": kind, "data": items, "count": len(items)}, indent=2))
+        else:
+            print(f"\n📋 CENTRAL BRAIN LIST: {kind.upper()} ({len(items)} items)")
+            print("="*68)
+            if kind == "facts":
+                if not items:
+                    print("  No facts found.")
+                for item in items:
+                    print(f"  [#{item['id']}] [{item['category']}] ({item['entity']}): {item['fact']}")
+            elif kind == "sources":
+                if not items:
+                    print("  No registered sources found.")
+                for item in items:
+                    stat = "EXISTS" if item["exists"] else "MISSING"
+                    print(f"  • {item['path']:<45} [{stat}] ({item['type']}, {item['indexed_chunks']} chunks)")
+            elif kind == "projects":
+                if not items:
+                    print("  No projects found.")
+                for item in items:
+                    stack_str = ", ".join(item["tech_stack"]) if item["tech_stack"] else "General"
+                    git_str = f"git: {item['git_branch']}" if item["git_branch"] else "no git"
+                    state_str = Path(item["resolved_file"]).name if item["resolved_file"] else "no state"
+                    print(f"  • {item['name']:<20} | {stack_str:<25} | {state_str:<18} | {git_str}")
+                    print(f"    Path: {item['path']}")
+            elif kind == "backups":
+                if not items:
+                    print("  No backups found.")
+                for item in items:
+                    print(f"  • {item['filename']:<35} ({item['size_mb']} MB) - {item['created_at']}")
+            print("="*68 + "\n")
 
     elif args.command == "inject":
         ctx = generate_role_context(args.role, args.path, args.tokens)
@@ -2353,13 +3151,15 @@ def main():
                 print(f"❌ Error: Path '{args.path}' does not exist.")
 
     elif args.command == "sync":
-        paths, chunks, del_files, del_chunks = sync_brain()
+        paths, chunks, del_files, del_chunks, backfilled = sync_brain()
         if is_json:
-            print(json.dumps({"status": "success", "command": "sync", "data": {"synced_paths": paths, "total_chunks": chunks, "purged_files": del_files, "purged_chunks": del_chunks}}, indent=2))
+            print(json.dumps({"status": "success", "command": "sync", "data": {"synced_paths": paths, "total_chunks": chunks, "purged_files": del_files, "purged_chunks": del_chunks, "backfilled_embeddings": backfilled}}, indent=2))
         else:
             msg = f"🔄 Central Brain Sync Complete: Processed {paths} sources ({chunks} total chunks active)."
             if del_files > 0:
                 msg += f" Purged {del_files} deleted files ({del_chunks} orphan chunks removed)."
+            if backfilled > 0:
+                msg += f" Backfilled {backfilled} missing vector embeddings."
             print(msg)
 
     elif args.command == "prune":

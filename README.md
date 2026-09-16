@@ -68,9 +68,21 @@ brain status
 
 ### 1. Command Line Interface (`brain`)
 ```bash
-# Transparent system paths & workspace introspection
+# Comprehensive system paths, workspace diagnostics, Git status, & toolchain
+brain info
+brain info [project_path]
 brain info --paths
-brain paths --json
+brain info --json
+
+# Run 7-point health check across SQLite, Ollama, vector completeness, & registries
+brain doctor
+brain doctor --fix      # Automatically self-heal missing embeddings, dead sources, & FTS5
+
+# List facts, registered sources, discovered projects across machine, and backups
+brain list facts -l 10
+brain list sources
+brain list projects
+brain list backups
 
 # Query the brain across all past projects & fixes (returns deterministic [#id])
 brain query "bluetooth autosuspend"
