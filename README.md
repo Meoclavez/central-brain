@@ -80,31 +80,41 @@ brain doctor --fix      # Automatically self-heal missing embeddings, dead sourc
 
 # List facts, registered sources, discovered projects across machine, and backups
 brain list facts -l 10
+brain list facts -q "audio"          # Search facts by keyword
 brain list sources
 brain list projects
 brain list backups
 
-# Query the brain across all past projects & fixes (returns deterministic [#id])
+# Register & manage knowledge sources
+brain sources list                  # List registered folders & files with chunk counts
+brain sources add /path/to/docs     # Register and index new directory immediately
+brain sources remove /path/to/docs  # Unregister source and purge its chunks
+
+# Query the brain across past projects & fixes (returns deterministic [#id])
 brain query "bluetooth autosuspend"
+brain query "kernel" --facts-only   # Retrieve only structured facts (skip vector/chunks)
+brain query "audio" --chunks-only   # Retrieve only document chunks (skip facts)
 
 # Token-efficient compact query mode (single-line facts & chunk citations)
 brain query "bluetooth" --compact
 brain query "bluetooth" --terse --max-tokens 300
 
-# Precision filtered query (category, entity, JSON output)
-brain query "bluetooth" -c "Fix" -e "MediaTek MT7921" --json
+# Precision filtered query (category shortcuts, entity, JSON output)
+brain query "bluetooth" --fix -e "MediaTek MT7921" --json
 
-# Remember a new decision or fix across sessions
-brain remember "MediaTek MT7921 Wi-Fi stable on kernel 7.1.5+" --entity "Wi-Fi" --category "Fix"
+# Remember a new decision, rule, or fix across sessions (smart entity resolution + tags)
+brain remember "MediaTek MT7921 Wi-Fi stable on kernel 7.1.5+" --fix --tags "wifi,mt7921,kernel"
+brain remember "WAL mode enforced for all SQLite databases" --rule
+brain remember "Core functionality complete" --project
 
 # Precision fact correction by deterministic fact ID (in-place update)
-brain correct --id 42 "MediaTek MT7921 Wi-Fi stable on kernel 7.1.5+"
+brain correct --id 42 "MediaTek MT7921 Wi-Fi stable on kernel 7.1.5+" --fix
 brain correct 42 "MediaTek MT7921 Wi-Fi stable on kernel 7.1.5+"
 
 # Erase an invalid, false, or obsolete memory by deterministic fact ID or search term
 brain forget --id 42
 brain forget 42
-brain forget "temporary false assumption" --entity "Wi-Fi"
+brain forget "temporary false assumption" --entity "Wi-Fi" -c "Fix"
 
 # Inspect spec-driven project state with resolved file path header
 brain state [project_path]
@@ -113,9 +123,10 @@ brain state [project_path]
 brain state --section "System Hardware Status"
 brain state --section "Next Actions" --max-tokens 200
 
-# Mutate project state (.planning/STATE.md) without manual file rewrites
-brain state --add action "Empirically verify unit tests"
-brain state --add decision "Selected SQLite WAL mode"
+# Direct shortcuts to append action items, decisions, or blockers to STATE.md
+brain state --action "Empirically verify unit tests"
+brain state --decision "Selected SQLite WAL mode"
+brain state --blocker "Awaiting kernel patch"
 brain state --phase "Phase 2: Execution" --status "In Progress"
 
 # Project map inspection & mutation (.agents/project_map.md)
@@ -139,7 +150,9 @@ brain export ~/MEMORY.md -d 7
 # Create a transactional point-in-time snapshot backup
 brain backup
 
-# Restore Central Brain from a backup archive
+# Restore Central Brain from a backup archive (defaults to latest backup)
+brain restore
+brain restore latest
 brain restore ~/.central_brain/backups/brain_backup_YYYYMMDD_HHMMSS.tar.gz
 
 # Ingest a new Markdown document or project folder
@@ -148,7 +161,8 @@ brain ingest /path/to/project/
 # Sync all registered directories listed in sources.json (including .planning/ folders)
 brain sync
 
-# Clean deleted files, deduplicate facts, and vacuum DB
+# Clean deleted files, deduplicate facts, and vacuum DB (with dry-run preview)
+brain prune --dry-run               # Preview deletions without modifying database
 brain prune
 
 # View database health & stats

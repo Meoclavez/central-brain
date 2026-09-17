@@ -406,8 +406,35 @@ def sync_facts_json():
     with open(FACTS_PATH, "w", encoding="utf-8") as f:
         json.dump(facts_list, f, indent=2)
 
-def remember(fact: str, entity: str = "General", category: str = "Knowledge", source: str = "CLI"):
-    """Saves a structured fact to SQLite, syncs facts.json, and appends to today's episode file."""
+def remember(fact: str, entity: str = None, category: str = "Knowledge", source: str = "CLI", tags: list[str] = None):
+    """Saves a structured fact to SQLite, syncs facts.json, and appends to today's episode file.
+    If entity is None or 'General', auto-resolves to current project name if inside a project directory.
+    """
+    ensure_dirs()
+    cat_map = {"fix": "Fix", "rule": "Rule", "knowledge": "Knowledge", "project": "Project"}
+    category = cat_map.get(str(category).lower(), str(category).capitalize() if category else "Knowledge")
+
+    # Smart Entity Resolution: If entity is empty or default 'General', detect active project
+    if not entity or entity.strip().lower() in ["general", "none", ""]:
+        st = get_project_state(Path.cwd())
+        if st.get("project_path") and Path(st["project_path"]) != Path.home():
+            entity = Path(st["project_path"]).name
+        else:
+            entity = "General"
+    else:
+        entity = entity.strip()
+
+    # Append tags to fact if provided
+    if tags:
+        tag_tokens = []
+        for t in tags:
+            for part in str(t).split(","):
+                part = part.strip().lstrip("#")
+                if part and f"#{part}" not in fact:
+                    tag_tokens.append(f"#{part}")
+        if tag_tokens:
+            fact = f"{fact} {' '.join(tag_tokens)}"
+
     conn = get_db()
     with conn:
         conn.execute(
@@ -428,7 +455,7 @@ def remember(fact: str, entity: str = "General", category: str = "Knowledge", so
     ingest_file(today_file)
     return True
 
-def forget(target: str = None, entity: str = None, fact_id: int = None):
+def forget(target: str = None, entity: str = None, fact_id: int = None, category: str = None):
     """Deletes matching facts or a specific fact by ID, syncs facts.json, and records an invalidation log."""
     conn = get_db()
     deleted_count = 0
@@ -449,14 +476,24 @@ def forget(target: str = None, entity: str = None, fact_id: int = None):
                 purged_info = f"fact #{fact_id} [{row['category']}] ({row['entity']}): '{row['fact']}'"
             else:
                 return 0
-        elif entity and entity != "General":
-            cur = conn.execute("DELETE FROM facts WHERE entity = ? AND (fact LIKE ? OR ? = '')", (entity, f"%{target}%", target or ""))
-            deleted_count = cur.rowcount
-            purged_info = f"facts under entity '{entity}' matching '{target}'"
         else:
-            cur = conn.execute("DELETE FROM facts WHERE fact LIKE ? OR entity LIKE ?", (f"%{target}%", f"%{target}%"))
+            conds = []
+            params = []
+            if target:
+                conds.append("(fact LIKE ? OR entity LIKE ?)")
+                params.extend([f"%{target}%", f"%{target}%"])
+            if entity and entity != "General":
+                conds.append("entity = ? COLLATE NOCASE")
+                params.append(entity)
+            if category:
+                conds.append("category = ? COLLATE NOCASE")
+                params.append(category)
+            if not conds:
+                return 0
+            where_sql = " AND ".join(conds)
+            cur = conn.execute(f"DELETE FROM facts WHERE {where_sql}", params)
             deleted_count = cur.rowcount
-            purged_info = f"facts matching '{target}'"
+            purged_info = f"{deleted_count} fact(s) matching '{target or '*'}' (entity: {entity or 'any'}, category: {category or 'any'})"
 
     sync_facts_json()
 
@@ -475,6 +512,8 @@ def forget(target: str = None, entity: str = None, fact_id: int = None):
 def correct(entity: str = None, new_fact: str = None, old_fact_search: str = None, category: str = "Fix", source: str = "CLI", fact_id: int = None):
     """Corrects/supersedes an existing memory with a new finding by ID or entity search."""
     conn = get_db()
+    cat_map = {"fix": "Fix", "rule": "Rule", "knowledge": "Knowledge", "project": "Project"}
+    category = cat_map.get(str(category).lower(), str(category).capitalize() if category else "Fix")
 
     # Auto-detect numeric ID in entity (e.g. `brain correct 42 "new fact"`)
     if fact_id is None and entity:
@@ -564,101 +603,109 @@ def calculate_recency_and_category_boost(doc: dict) -> float:
     return boost
 
 def search_brain(query: str, top_k: int = 5, entity: str = None, category: str = None,
-                 source: str = None, since: str = None, until: str = None, path_filter: str = None):
+                 source: str = None, since: str = None, until: str = None, path_filter: str = None,
+                 facts_only: bool = False, chunks_only: bool = False):
     """
     Recency-weighted Hybrid Search across Vectors, FTS5 Keywords, and Structured Facts.
-    Supports multi-field precision filtering.
+    Supports multi-field precision filtering and selective retrieval (facts_only / chunks_only).
     """
     conn = get_db()
-    query_vec = get_embedding(query) if query else None
-
-    # 1. Dense Vector Search
-    vector_results = []
-    if query_vec:
-        sql = "SELECT id, file_path, header, content, embedding, updated_at FROM chunks WHERE embedding IS NOT NULL"
-        params = []
-        if path_filter:
-            sql += " AND file_path LIKE ?"
-            params.append(f"%{path_filter}%")
-        rows = conn.execute(sql, params).fetchall()
-        for r in rows:
-            vec = decode_vector_blob(r['embedding'])
-            sim = cosine_similarity(query_vec, vec)
-            vector_results.append((sim, dict(r)))
-        vector_results.sort(key=lambda x: x[0], reverse=True)
-
-    # 2. FTS5 Keyword Search
-    fts_results = {}
-    if query:
-        try:
-            clean_q = "".join([c if c.isalnum() or c.isspace() else " " for c in query]).strip()
-            if clean_q:
-                sql = "SELECT rowid as id, file_path, header, content, rank, updated_at FROM chunks_fts WHERE chunks_fts MATCH ?"
-                params = [clean_q]
-                if path_filter:
-                    sql += " AND file_path LIKE ?"
-                    params.append(f"%{path_filter}%")
-                sql += " ORDER BY rank LIMIT 25"
-                fts_rows = conn.execute(sql, params).fetchall()
-                for rank_idx, r in enumerate(fts_rows):
-                    fts_results[r['id']] = 1.0 / (rank_idx + 1)
-        except Exception:
-            pass
-
-    # 3. Recency-Weighted Hybrid Scoring
-    hybrid_scores = {}
-    doc_map = {}
-
-    for sim, doc in vector_results[:40]:
-        doc_id = doc['id']
-        doc_map[doc_id] = doc
-        hybrid_scores[doc_id] = hybrid_scores.get(doc_id, 0.0) + (0.70 * sim)
-
-    for doc_id, kw_score in fts_results.items():
-        if doc_id not in doc_map:
-            r = conn.execute("SELECT id, file_path, header, content, updated_at FROM chunks WHERE id = ?", (doc_id,)).fetchone()
-            if r:
-                doc_map[doc_id] = dict(r)
-        hybrid_scores[doc_id] = hybrid_scores.get(doc_id, 0.0) + (0.30 * kw_score)
-
-    final_ranked = []
-    for doc_id, base_score in hybrid_scores.items():
-        if doc_id in doc_map:
-            doc = doc_map[doc_id]
-            multiplier = calculate_recency_and_category_boost(doc)
-            final_score = base_score * multiplier
-            final_ranked.append((final_score, doc))
-
-    final_ranked.sort(key=lambda x: x[0], reverse=True)
-    top_docs = final_ranked[:top_k]
-
-    # 4. Structured Facts Search with Precision Filtering
-    fact_conditions = []
-    fact_params = []
-    if query:
-        fact_conditions.append("(fact LIKE ? OR entity LIKE ?)")
-        fact_params.extend([f"%{query}%", f"%{query}%"])
-    if entity:
-        fact_conditions.append("entity = ? COLLATE NOCASE")
-        fact_params.append(entity)
+    cat_map = {"fix": "Fix", "rule": "Rule", "knowledge": "Knowledge", "project": "Project"}
     if category:
-        fact_conditions.append("category = ? COLLATE NOCASE")
-        fact_params.append(category)
-    if source:
-        fact_conditions.append("source = ? COLLATE NOCASE")
-        fact_params.append(source)
-    if since:
-        fact_conditions.append("timestamp >= ?")
-        fact_params.append(since)
-    if until:
-        fact_conditions.append("timestamp <= ?")
-        fact_params.append(until)
+        category = cat_map.get(str(category).lower(), category)
 
-    where_sql = " AND ".join(fact_conditions) if fact_conditions else "1=1"
-    facts_rows = conn.execute(
-        f"SELECT id, entity, category, fact, source, timestamp FROM facts WHERE {where_sql} ORDER BY id DESC LIMIT ?",
-        (*fact_params, top_k)
-    ).fetchall()
+    # 1. Dense Vector & FTS5 Search (skipped if facts_only)
+    top_docs = []
+    if not facts_only:
+        query_vec = get_embedding(query) if query else None
+        vector_results = []
+        if query_vec:
+            sql = "SELECT id, file_path, header, content, embedding, updated_at FROM chunks WHERE embedding IS NOT NULL"
+            params = []
+            if path_filter:
+                sql += " AND file_path LIKE ?"
+                params.append(f"%{path_filter}%")
+            rows = conn.execute(sql, params).fetchall()
+            for r in rows:
+                vec = decode_vector_blob(r['embedding'])
+                sim = cosine_similarity(query_vec, vec)
+                vector_results.append((sim, dict(r)))
+            vector_results.sort(key=lambda x: x[0], reverse=True)
+
+        # 2. FTS5 Keyword Search
+        fts_results = {}
+        if query:
+            try:
+                clean_q = "".join([c if c.isalnum() or c.isspace() else " " for c in query]).strip()
+                if clean_q:
+                    sql = "SELECT rowid as id, file_path, header, content, rank, updated_at FROM chunks_fts WHERE chunks_fts MATCH ?"
+                    params = [clean_q]
+                    if path_filter:
+                        sql += " AND file_path LIKE ?"
+                        params.append(f"%{path_filter}%")
+                    sql += " ORDER BY rank LIMIT 25"
+                    fts_rows = conn.execute(sql, params).fetchall()
+                    for rank_idx, r in enumerate(fts_rows):
+                        fts_results[r['id']] = 1.0 / (rank_idx + 1)
+            except Exception:
+                pass
+
+        # 3. Recency-Weighted Hybrid Scoring
+        hybrid_scores = {}
+        doc_map = {}
+
+        for sim, doc in vector_results[:40]:
+            doc_id = doc['id']
+            doc_map[doc_id] = doc
+            hybrid_scores[doc_id] = hybrid_scores.get(doc_id, 0.0) + (0.70 * sim)
+
+        for doc_id, kw_score in fts_results.items():
+            if doc_id not in doc_map:
+                r = conn.execute("SELECT id, file_path, header, content, updated_at FROM chunks WHERE id = ?", (doc_id,)).fetchone()
+                if r:
+                    doc_map[doc_id] = dict(r)
+            hybrid_scores[doc_id] = hybrid_scores.get(doc_id, 0.0) + (0.30 * kw_score)
+
+        final_ranked = []
+        for doc_id, base_score in hybrid_scores.items():
+            if doc_id in doc_map:
+                doc = doc_map[doc_id]
+                multiplier = calculate_recency_and_category_boost(doc)
+                final_score = base_score * multiplier
+                final_ranked.append((final_score, doc))
+
+        final_ranked.sort(key=lambda x: x[0], reverse=True)
+        top_docs = final_ranked[:top_k]
+
+    # 4. Structured Facts Search with Precision Filtering (skipped if chunks_only)
+    facts_rows = []
+    if not chunks_only:
+        fact_conditions = []
+        fact_params = []
+        if query:
+            fact_conditions.append("(fact LIKE ? OR entity LIKE ?)")
+            fact_params.extend([f"%{query}%", f"%{query}%"])
+        if entity:
+            fact_conditions.append("entity = ? COLLATE NOCASE")
+            fact_params.append(entity)
+        if category:
+            fact_conditions.append("category = ? COLLATE NOCASE")
+            fact_params.append(category)
+        if source:
+            fact_conditions.append("source = ? COLLATE NOCASE")
+            fact_params.append(source)
+        if since:
+            fact_conditions.append("timestamp >= ?")
+            fact_params.append(since)
+        if until:
+            fact_conditions.append("timestamp <= ?")
+            fact_params.append(until)
+
+        where_sql = " AND ".join(fact_conditions) if fact_conditions else "1=1"
+        facts_rows = conn.execute(
+            f"SELECT id, entity, category, fact, source, timestamp FROM facts WHERE {where_sql} ORDER BY id DESC LIMIT ?",
+            (*fact_params, top_k)
+        ).fetchall()
 
     return {
         "chunks": [{"score": round(score, 4), **{k: v for k, v in doc.items() if k != 'embedding'}} for score, doc in top_docs],
@@ -1630,12 +1677,21 @@ def generate_role_context(role: str = "general", target_dir: Path = None, max_to
     raw_text = "\n".join(lines)
     return apply_token_budget(raw_text, max_tokens)
 
-def clean_orphans():
+def clean_orphans(dry_run: bool = False):
     """Finds indexed files that no longer exist on disk and purges their chunks & FTS entries."""
     conn = get_db()
     indexed_files = [r[0] for r in conn.execute("SELECT DISTINCT file_path FROM chunks").fetchall()]
     orphan_files = 0
     orphan_chunks = 0
+
+    if dry_run:
+        for fp_str in indexed_files:
+            p = Path(fp_str)
+            if not p.exists():
+                count = conn.execute("SELECT COUNT(*) FROM chunks WHERE file_path = ?", (fp_str,)).fetchone()[0]
+                orphan_files += 1
+                orphan_chunks += count
+        return orphan_files, orphan_chunks
 
     with conn:
         for fp_str in indexed_files:
@@ -1643,15 +1699,25 @@ def clean_orphans():
             if not p.exists():
                 count = conn.execute("SELECT COUNT(*) FROM chunks WHERE file_path = ?", (fp_str,)).fetchone()[0]
                 conn.execute("DELETE FROM chunks WHERE file_path = ?", (fp_str,))
+                conn.execute("DELETE FROM chunks_fts WHERE file_path = ?", (fp_str,))
                 orphan_files += 1
                 orphan_chunks += count
 
     return orphan_files, orphan_chunks
 
-def prune_brain():
+def prune_brain(dry_run: bool = False):
     """Cleans orphan files, deduplicates facts, and vacuums the SQLite database."""
-    orphans_files, orphan_chunks = clean_orphans()
+    orphans_files, orphan_chunks = clean_orphans(dry_run=dry_run)
     conn = get_db()
+
+    dupe_facts_count = conn.execute("""
+        SELECT COUNT(*) FROM facts WHERE id NOT IN (
+            SELECT MAX(id) FROM facts GROUP BY entity, category, fact
+        )
+    """).fetchone()[0]
+
+    if dry_run:
+        return orphans_files, orphan_chunks, dupe_facts_count
 
     with conn:
         conn.execute("""
@@ -1668,7 +1734,7 @@ def prune_brain():
     conn.execute("VACUUM;")
     conn.isolation_level = prev_iso
 
-    return orphans_files, orphan_chunks
+    return orphans_files, orphan_chunks, dupe_facts_count
 
 def backup_brain(output_path: Path = None, include_vault: bool = True) -> tuple[bool, str, dict]:
     """Creates a transactional SQLite snapshot and packages the Central Brain vault."""
@@ -1725,11 +1791,22 @@ def backup_brain(output_path: Path = None, include_vault: bool = True) -> tuple[
     finally:
         shutil.rmtree(temp_snapshot_dir, ignore_errors=True)
 
-def restore_brain(backup_path: Path, force: bool = False) -> tuple[bool, str]:
+def restore_brain(backup_path: Path | str = "latest", force: bool = False) -> tuple[bool, str]:
     """Restores Central Brain database and vault from a backup archive."""
-    backup_path = Path(backup_path).resolve()
-    if not backup_path.exists():
-        return False, f"Backup file {backup_path} does not exist."
+    ensure_dirs()
+    if not backup_path or str(backup_path).lower() in ["latest", "last"]:
+        backups = sorted(BACKUP_DIR.glob("*.tar.gz"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not backups:
+            return False, f"No backup archives found in {BACKUP_DIR}."
+        target_path = backups[0]
+    else:
+        target_path = Path(backup_path)
+        if not target_path.exists() and (BACKUP_DIR / backup_path).exists():
+            target_path = BACKUP_DIR / backup_path
+        target_path = target_path.resolve()
+
+    if not target_path.exists():
+        return False, f"Backup file {target_path} does not exist."
 
     # Create safety backup of current state
     if not force:
@@ -1741,7 +1818,7 @@ def restore_brain(backup_path: Path, force: bool = False) -> tuple[bool, str]:
     extract_tmp.mkdir(parents=True, exist_ok=True)
 
     try:
-        with tarfile.open(backup_path, "r:gz") as tar:
+        with tarfile.open(target_path, "r:gz") as tar:
             tar.extractall(extract_tmp)
 
         restored_db = extract_tmp / "brain.db"
@@ -1764,7 +1841,7 @@ def restore_brain(backup_path: Path, force: bool = False) -> tuple[bool, str]:
             if src_v.exists():
                 shutil.copytree(src_v, BRAIN_DIR / vdir, dirs_exist_ok=True)
 
-        return True, f"Central Brain restored successfully from {backup_path}"
+        return True, f"Central Brain restored successfully from {target_path}"
     except Exception as e:
         return False, f"Restore failed: {e}"
     finally:
@@ -1838,6 +1915,75 @@ def export_brain(output_file: Path = None, fmt: str = "markdown", category: str 
         output_file.write_text(out_str, encoding="utf-8")
 
     return out_str
+
+def add_source(path: Path | str) -> tuple[bool, str, int]:
+    """Registers a new file or directory in sources.json and ingests it into vector DB."""
+    ensure_dirs()
+    p = Path(path).resolve()
+    if not p.exists():
+        return False, f"Path does not exist: {p}", 0
+
+    sources = []
+    if SOURCES_PATH.exists():
+        try:
+            with open(SOURCES_PATH, "r", encoding="utf-8") as f:
+                sources = json.load(f)
+        except Exception:
+            sources = []
+
+    p_str = str(p)
+    if p_str in sources:
+        return True, f"Source already registered: {p_str}", 0
+
+    sources.append(p_str)
+    try:
+        with open(SOURCES_PATH, "w", encoding="utf-8") as f:
+            json.dump(sources, f, indent=2)
+    except Exception as e:
+        return False, f"Failed to save sources.json: {e}", 0
+
+    chunks = ingest_file(p) if p.is_file() else ingest_directory(p)
+    return True, f"Successfully registered and indexed source ({chunks} chunks): {p_str}", chunks
+
+def remove_source(path: Path | str, purge_chunks: bool = True) -> tuple[bool, str, int]:
+    """Removes a source from sources.json and optionally purges its indexed chunks from DB."""
+    ensure_dirs()
+    p = Path(path).resolve()
+    p_str = str(p)
+
+    sources = []
+    if SOURCES_PATH.exists():
+        try:
+            with open(SOURCES_PATH, "r", encoding="utf-8") as f:
+                sources = json.load(f)
+        except Exception:
+            sources = []
+
+    matched = None
+    for s in sources:
+        if s == p_str or s == str(path) or (Path(s).exists() and Path(s).resolve() == p):
+            matched = s
+            break
+
+    if not matched:
+        return False, f"Source not found in registry: {path}", 0
+
+    sources.remove(matched)
+    try:
+        with open(SOURCES_PATH, "w", encoding="utf-8") as f:
+            json.dump(sources, f, indent=2)
+    except Exception as e:
+        return False, f"Failed to update sources.json: {e}", 0
+
+    purged_count = 0
+    if purge_chunks:
+        conn = get_db()
+        with conn:
+            purged_count = conn.execute("DELETE FROM chunks WHERE file_path = ? OR file_path LIKE ?", (matched, f"{matched}/%")).rowcount
+            if purged_count > 0:
+                conn.execute("DELETE FROM chunks_fts WHERE file_path = ? OR file_path LIKE ?", (matched, f"{matched}/%"))
+
+    return True, f"Successfully removed source '{matched}' (purged {purged_count} chunks from database).", purged_count
 
 def sync_brain():
     """Scans all registered directories/files and updates modified content in vector DB."""
@@ -2122,8 +2268,8 @@ def run_doctor(fix: bool = False) -> tuple[bool, dict]:
     }
     return all_passed, results
 
-def list_brain_items(kind: str = "facts", category: str = None, entity: str = None, limit: int = 25) -> tuple[str, list]:
-    """Lists facts, sources, discovered projects, or backups."""
+def list_brain_items(kind: str = "facts", category: str = None, entity: str = None, limit: int = 25, query: str = None) -> tuple[str, list]:
+    """Lists facts, sources, discovered projects, or backups with optional query filtering."""
     ensure_dirs()
     kind = (kind or "facts").lower().strip()
 
@@ -2138,6 +2284,9 @@ def list_brain_items(kind: str = "facts", category: str = None, entity: str = No
         if entity:
             wheres.append("LOWER(entity) = LOWER(?)")
             params.append(entity)
+        if query:
+            wheres.append("(fact LIKE ? OR entity LIKE ?)")
+            params.extend([f"%{query}%", f"%{query}%"])
         if wheres:
             q += " WHERE " + " AND ".join(wheres)
         q += " ORDER BY id DESC LIMIT ?"
@@ -2169,7 +2318,9 @@ def list_brain_items(kind: str = "facts", category: str = None, entity: str = No
                     })
             except Exception:
                 pass
-        return "sources", items
+        if query:
+            items = [i for i in items if query.lower() in i["path"].lower()]
+        return "sources", items[:limit]
 
     elif kind in ["projects", "project"]:
         items = []
@@ -2200,7 +2351,14 @@ def list_brain_items(kind: str = "facts", category: str = None, entity: str = No
                         "git_branch": git.get("branch") if git.get("is_git_repo") else None,
                         "git_clean": git.get("clean") if git.get("is_git_repo") else None
                     })
-        return "projects", items
+        if query:
+            items = [
+                i for i in items 
+                if query.lower() in i["name"].lower() 
+                or query.lower() in i["path"].lower() 
+                or (i.get("tech_stack") and any(query.lower() in t.lower() for t in i["tech_stack"]))
+            ]
+        return "projects", items[:limit]
 
     elif kind in ["backups", "backup"]:
         items = []
@@ -2214,7 +2372,9 @@ def list_brain_items(kind: str = "facts", category: str = None, entity: str = No
                     "size_mb": sz_mb,
                     "created_at": mtime_str
                 })
-        return "backups", items
+        if query:
+            items = [i for i in items if query.lower() in i["filename"].lower()]
+        return "backups", items[:limit]
 
     else:
         return "error", [{"error": f"Unknown list type '{kind}'. Choose from 'facts', 'sources', 'projects', 'backups'."}]
@@ -2501,29 +2661,206 @@ class BrainArgumentParser(argparse.ArgumentParser):
         super().error(message)
 
 def main():
-    epilog_text = """
-Examples:
-  # Introspection & Diagnostics
-  brain info                      Inspect paths, active workspace, Git status, and toolchain
-  brain info /path/to/project     Inspect a specific project workspace
-  brain doctor                    Run 7-point health check across SQLite, Ollama, and registries
-  brain doctor --fix              Automatically self-heal missing vectors, dead sources, and FTS5
+    epilog_text = """COMMAND DEFINITIONS & ARGUMENT SPECIFICATIONS:
 
-  # Dynamic Memory & Search
-  brain query "mt7921 bluetooth"  Query verified facts & indexed documents
-  brain query "audio" --compact   Token-efficient 1-line facts with [#id]
-  brain remember "rule" -c Rule   Save verified solution or rule
-  brain list facts                List recent facts with IDs and categories
-  brain correct --id 42 "new"     In-place deterministic update by ID
-  brain forget --id 42            Deterministic deletion by ID
+  1. DYNAMIC MEMORY & SEARCH
+     brain query <text> [options] (alias: search)
+       Query verified facts, rules, and indexed document chunks.
+       Positional:
+         <text>                     Search query or keywords (required string)
+       Options:
+         -k, --top-k INT            Maximum results to return (default: 5)
+         -l, --limit INT            Alias for --top-k limit
+         -e, --entity NAME          Filter facts by exact/case-insensitive entity name
+         -c, --category CAT         Filter facts by category: Fix, Rule, Knowledge, Project
+         --rule, --fix, --project, --knowledge
+                                    Direct category filter shortcuts
+         -s, --source NAME          Filter facts by source origin (e.g. CLI, MCP)
+         --since YYYY-MM-DD         Filter facts created on or after date
+         --until YYYY-MM-DD         Filter facts created on or before date
+         -p, --path PATTERN         Filter indexed document chunks by path substring
+         --facts-only               Search and return structured facts only (skips vector/chunks)
+         --chunks-only              Search and return document chunks only (skips facts)
+         -c, --compact, --terse     Token-efficient single-line output format with deterministic [#id]
+         --max-tokens INT           Limit output to approximate token budget
+         --json                     Output in structured JSON format
 
-  # Project State & Architecture Map
-  brain state                     Show resolved project state or documentation summary
-  brain state -s "Decisions"      Inspect a specific section without context blowout
-  brain state --add action "task" Add action item to active STATE.md
-  brain map show                  Display active project map (.agents/project_map.md)
-  brain map add "Rules" "- rule"  Append rule to project map section
-  brain inject hardware           Generate verified context prompt for subagents (<800 tokens)
+     brain remember <fact> [options]
+       Persist a verified discovery, solution, rule, or architectural decision.
+       Positional:
+         <fact>                     Verified fact, rule, or fix to store (required string)
+       Options:
+         -e, --entity NAME          Entity/topic (auto-detected from current project if omitted)
+         -c, --category CAT         Category: Knowledge (default), Fix, Rule, Project
+         --rule, --fix, --project, --knowledge
+                                    Direct category shortcuts
+         -t, --tags TAGS            Comma-separated tags to append (e.g. 'wifi,driver,kernel')
+         -s, --source NAME          Origin identifier (default: 'CLI')
+         --json                     Output in structured JSON format
+
+     brain forget [<target>] [options]
+       Purge wrong or outdated memories from Central Brain.
+       Positional:
+         [target]                   Fact ID (integer) or search phrase to remove (optional)
+       Options:
+         --id INT                   Deterministic deletion by exact fact ID
+         -e, --entity NAME          Filter deletion by entity/topic
+         -c, --category CAT         Filter deletion by category (Fix, Rule, Knowledge, Project)
+         --json                     Output in structured JSON format
+
+     brain correct [<entity>|<id>] [<new_fact>] [options]
+       In-place update or superseding of a memory with verified findings.
+       Positional:
+         [entity]                   Entity name OR fact ID (if first argument is integer)
+         [new_fact]                 New verified replacement text or solution
+       Options:
+         --id INT                   Deterministic in-place update by exact fact ID
+         -o, --old OLD              Old text substring to replace (if not using --id)
+         -c, --category CAT         Updated category: Fix, Rule, Knowledge, Project
+         --rule, --fix              Direct category shortcuts
+         -s, --source NAME          Source identifier (default: 'CLI')
+         --json                     Output in structured JSON format
+
+     brain list [kind] [options] (alias: ls)
+       Inventory facts, registered sources, discovered projects, or backups.
+       Positional:
+         [kind]                     Item type: facts (default), sources, projects, backups
+       Options:
+         -c, --category CAT         Filter facts by category (Fix, Rule, Knowledge, Project)
+         -e, --entity NAME          Filter facts by entity/topic
+         -q, --query, --search TEXT Search/filter items by keyword across all types
+         -l, --limit INT            Maximum number of items to display (default: 25)
+         --json                     Output in structured JSON format
+
+  2. PROJECT STATE & MAP
+     brain state [path] [options] (alias: plan)
+       Inspect or mutate spec-driven project state (.planning/STATE.md or project map).
+       Positional:
+         [path]                     Target project directory (default: current directory)
+       Options:
+         -s, --section NAME         Filter output to a specific markdown section header
+         -c, --compact, --summary   Token-efficient overview with section list
+         --outline                  Display section outline of the document only
+         --full                     Display full un-truncated content (disables preview capping)
+         --max-tokens INT           Limit output to approximate token budget
+         --add TYPE TEXT            Append entry: --add <action|decision|blocker> '<text>'
+         --action TEXT              Direct shortcut: add action item to active STATE.md
+         --decision TEXT            Direct shortcut: record architectural decision in STATE.md
+         --blocker TEXT             Direct shortcut: record blocker in STATE.md
+         --phase PHASE              Update active phase in STATE.md
+         --status STATUS            Update project status in STATE.md
+         --json                     Output in structured JSON format
+
+     brain map [subcommand] [args...]
+       Inspect or mutate autonomous project map (.agents/project_map.md).
+       Subcommands:
+         show [path]                Display active project map (supports -s, -c, --outline, --full)
+         list-sections [path]       List all markdown section headers in the active project map
+         add <sec> <entry> [p]      Append bullet point or text entry to a section
+         set-section <sec> <c> [p]  Replace body content of a specific section in project map
+         init [path]                Scaffold a new .agents/project_map.md in project directory
+       Options:
+         --json                     Output in structured JSON format
+
+     brain init-project <name> [path] [options]
+       Scaffold spec-driven .planning/ structure (PROJECT.md, ROADMAP.md, STATE.md).
+       Positional:
+         <name>                     Project name (required string)
+         [path]                     Target directory (default: current directory)
+       Options:
+         -d, --description DESC     Brief project summary description
+         --json                     Output in structured JSON format
+
+  3. SOURCES & INDEXING
+     brain sources [subcommand] [args...]
+       Manage registered Central Brain knowledge sources and directories.
+       Subcommands:
+         add <path>                 Register a file or directory in sources.json and index immediately
+         remove, rm <path>          Unregister a source and purge its indexed chunks from DB
+         list, ls                   List all registered sources with status and chunk counts (default)
+       Options:
+         --keep-chunks              On remove: do not delete chunks from vector database
+         -q, --query TEXT           On list: filter sources by keyword
+         --json                     Output in structured JSON format
+
+     brain ingest <path> [options]
+       Ingest markdown file or directory into vector index.
+       Positional:
+         <path>                     File or directory path to ingest (required)
+       Options:
+         --json                     Output in structured JSON format
+
+     brain sync [options]
+       Rescan all registered sources, ingest updated files, and backfill embeddings.
+       Options:
+         --json                     Output in structured JSON format
+
+     brain prune [options]
+       Clean deleted files, deduplicate facts, and vacuum database.
+       Options:
+         --dry-run                  Preview deletions without modifying database
+         --json                     Output in structured JSON format
+
+  4. SYSTEM, DIAGNOSTICS & BACKUPS
+     brain info [path] [options] (alias: paths)
+       Introspect Central Brain storage paths, Git status, tech stack, and toolchains.
+       Positional:
+         [path]                     Target workspace directory (default: current directory)
+       Options:
+         --paths                    Display Central Brain paths and storage locations
+         --json                     Output in structured JSON format
+
+     brain doctor [options] (alias: repair)
+       Run 7-point health check and self-heal Central Brain systems.
+       Options:
+         --fix                      Automatically repair detected issues (backfill vectors,
+                                    prune dead sources, rebuild FTS5, fresh backup)
+         --json                     Output in structured JSON format
+
+     brain inject [role] [options]
+       Generate a role-tailored system prompt context snippet (<800 tokens).
+       Positional:
+         [role]                     Subagent role: general (default), system, hardware,
+                                    frontend, web, backend, api, security, audit
+       Options:
+         -p, --path PATH            Workspace path to inject project context from
+         -t, --tokens INT           Maximum token budget (default: 800)
+         --json                     Output in structured JSON format
+
+     brain backup [output] [options]
+       Create a transactional snapshot and backup archive of Central Brain.
+       Positional:
+         [output]                   Destination archive file path (.tar.gz) (optional)
+       Options:
+         --no-vault                 Backup SQLite DB only, omit markdown vaults
+         --json                     Output in structured JSON format
+
+     brain restore [archive] [options]
+       Restore Central Brain database and vault from a backup archive.
+       Positional:
+         [archive]                  Backup archive path or 'latest' (default: latest)
+       Options:
+         --force                    Skip pre-restore safety snapshot
+         --json                     Output in structured JSON format
+
+     brain export [output] [options]
+       Export compiled memory digest (MEMORY.md or JSON).
+       Positional:
+         [output]                   Output destination file path (optional, prints to stdout)
+       Options:
+         --format FORMAT            Digest format: markdown (default) or json
+         -c, --category CAT         Filter facts by category
+         -e, --entity NAME          Filter facts by entity
+         -d, --days INT             Days of episode history to include (default: 30)
+         --json                     Output in structured JSON format
+
+     brain status [options]
+       Display system metrics, fact counts, vector chunks, and database size.
+       Options:
+         --json                     Output in structured JSON format
+
+     brain mcp
+       Start Central Brain Model Context Protocol (MCP) JSON-RPC 2.0 stdio server.
 """
     parser = BrainArgumentParser(
         description="Central Brain - Unified Local Agent Memory & State CLI",
@@ -2534,28 +2871,38 @@ Examples:
     sub = parser.add_subparsers(dest="command")
 
     # query / search
-    q_p = sub.add_parser("query", aliases=["search"], help="Query the central brain")
-    q_p.add_argument("text", type=str, help="Search query")
-    q_p.add_argument("-k", "--top-k", type=int, default=5, help="Number of results")
-    q_p.add_argument("-e", "--entity", type=str, default=None, help="Filter by entity")
-    q_p.add_argument("-c", "--category", type=str, default=None, help="Filter by category")
-    q_p.add_argument("-s", "--source", type=str, default=None, help="Filter by source")
-    q_p.add_argument("--since", type=str, default=None, help="Filter since date (YYYY-MM-DD)")
-    q_p.add_argument("--until", type=str, default=None, help="Filter until date (YYYY-MM-DD)")
-    q_p.add_argument("-p", "--path", type=str, default=None, help="Filter by file path pattern")
-    q_p.add_argument("--compact", "--terse", action="store_true", dest="compact", help="Token-efficient single-line output mode")
+    q_p = sub.add_parser("query", aliases=["search"], help="Query the central brain for verified facts and document chunks")
+    q_p.add_argument("text", type=str, help="Search query string or keywords")
+    q_p.add_argument("-k", "--top-k", type=int, default=5, help="Number of results to return (default: 5)")
+    q_p.add_argument("-l", "--limit", type=int, default=None, help="Alias for --top-k limit")
+    q_p.add_argument("-e", "--entity", type=str, default=None, help="Filter facts by entity name (case-insensitive)")
+    q_p.add_argument("-c", "--category", type=str, default=None, help="Filter facts by category: Fix, Rule, Knowledge, Project")
+    q_p.add_argument("--rule", action="store_true", help="Shortcut filter for category Rule")
+    q_p.add_argument("--fix", action="store_true", help="Shortcut filter for category Fix")
+    q_p.add_argument("--project", action="store_true", help="Shortcut filter for category Project")
+    q_p.add_argument("--knowledge", action="store_true", help="Shortcut filter for category Knowledge")
+    q_p.add_argument("-s", "--source", type=str, default=None, help="Filter facts by source origin (e.g. CLI, MCP)")
+    q_p.add_argument("--since", type=str, default=None, help="Filter facts created on or after date (YYYY-MM-DD)")
+    q_p.add_argument("--until", type=str, default=None, help="Filter facts created on or before date (YYYY-MM-DD)")
+    q_p.add_argument("-p", "--path", type=str, default=None, help="Filter indexed document chunks by file path pattern")
+    q_p.add_argument("--facts-only", action="store_true", help="Search and return structured facts only (skips vector/chunks)")
+    q_p.add_argument("--chunks-only", action="store_true", help="Search and return document chunks only (skips facts)")
+    q_p.add_argument("--compact", "--terse", action="store_true", dest="compact", help="Token-efficient single-line output format with [#id]")
     q_p.add_argument("--max-tokens", type=int, default=None, help="Limit output to approximate token budget")
     q_p.add_argument("--json", action="store_true", help="Output in JSON format")
 
     # state / plan
     st_cmd = sub.add_parser("state", aliases=["plan"], help="Inspect or mutate spec-driven project state (.planning/STATE.md)")
-    st_cmd.add_argument("path", nargs="?", default=None, help="Optional project directory")
+    st_cmd.add_argument("path", nargs="?", default=None, help="Optional project directory (default: current dir)")
     st_cmd.add_argument("-s", "--section", type=str, default=None, help="Filter output to a specific section name")
     st_cmd.add_argument("-c", "--compact", "--summary", action="store_true", dest="compact", help="Token-efficient summary view with section directory")
     st_cmd.add_argument("--outline", action="store_true", help="Display only the section outline of the document")
-    st_cmd.add_argument("--full", action="store_true", help="Display full un-truncated content")
+    st_cmd.add_argument("--full", action="store_true", help="Display full un-truncated content (disables preview capping)")
     st_cmd.add_argument("--max-tokens", type=int, default=None, help="Limit output to approximate token budget")
     st_cmd.add_argument("--add", nargs=2, metavar=("TYPE", "TEXT"), help="Add an entry: --add <action|decision|blocker> '<text>'")
+    st_cmd.add_argument("--action", type=str, default=None, metavar="TEXT", help="Direct shortcut: add action item to active STATE.md")
+    st_cmd.add_argument("--decision", type=str, default=None, metavar="TEXT", help="Direct shortcut: record architectural decision in STATE.md")
+    st_cmd.add_argument("--blocker", type=str, default=None, metavar="TEXT", help="Direct shortcut: record blocker in STATE.md")
     st_cmd.add_argument("--phase", type=str, default=None, help="Update active phase in STATE.md")
     st_cmd.add_argument("--status", type=str, default=None, help="Update status in STATE.md")
     st_cmd.add_argument("--json", action="store_true", help="Output in JSON format")
@@ -2565,7 +2912,7 @@ Examples:
     map_sub = map_p.add_subparsers(dest="map_action")
 
     map_show = map_sub.add_parser("show", help="Display the active project map")
-    map_show.add_argument("path", nargs="?", default=None, help="Optional project directory")
+    map_show.add_argument("path", nargs="?", default=None, help="Optional project directory (default: current dir)")
     map_show.add_argument("-s", "--section", type=str, default=None, help="Filter output to a specific section name")
     map_show.add_argument("-c", "--compact", "--summary", action="store_true", dest="compact", help="Token-efficient summary view with section directory")
     map_show.add_argument("--outline", action="store_true", help="Display only the section outline of the document")
@@ -2574,24 +2921,41 @@ Examples:
     map_show.add_argument("--json", action="store_true", help="Output in JSON format")
 
     map_ls = map_sub.add_parser("list-sections", help="List all markdown section headers in the active project map")
-    map_ls.add_argument("path", nargs="?", default=None, help="Optional project directory")
+    map_ls.add_argument("path", nargs="?", default=None, help="Optional project directory (default: current dir)")
     map_ls.add_argument("--json", action="store_true", help="Output in JSON format")
 
     map_add = map_sub.add_parser("add", help="Append an entry to a specific section in the project map")
     map_add.add_argument("section", type=str, help="Target section header name (e.g. 'Active System Rules')")
     map_add.add_argument("entry", type=str, help="Bullet point or text entry to append")
-    map_add.add_argument("path", nargs="?", default=None, help="Optional project directory")
+    map_add.add_argument("path", nargs="?", default=None, help="Optional project directory (default: current dir)")
     map_add.add_argument("--json", action="store_true", help="Output in JSON format")
 
     map_set = map_sub.add_parser("set-section", help="Replace the body of a specific section in the project map")
     map_set.add_argument("section", type=str, help="Target section header name")
     map_set.add_argument("content", type=str, help="New body content for the section")
-    map_set.add_argument("path", nargs="?", default=None, help="Optional project directory")
+    map_set.add_argument("path", nargs="?", default=None, help="Optional project directory (default: current dir)")
     map_set.add_argument("--json", action="store_true", help="Output in JSON format")
 
     map_init_cmd = map_sub.add_parser("init", help="Scaffold a new .agents/project_map.md in the project directory")
     map_init_cmd.add_argument("path", nargs="?", default=None, help="Target project directory (default: current dir)")
     map_init_cmd.add_argument("--json", action="store_true", help="Output in JSON format")
+
+    # sources
+    src_p = sub.add_parser("sources", help="Manage registered Central Brain knowledge sources and directories")
+    src_sub = src_p.add_subparsers(dest="sources_action")
+
+    src_add = src_sub.add_parser("add", help="Register a file or directory in sources.json and index immediately")
+    src_add.add_argument("path", type=str, help="File or directory path to register")
+    src_add.add_argument("--json", action="store_true", help="Output in JSON format")
+
+    src_rm = src_sub.add_parser("remove", aliases=["rm"], help="Unregister a source and optionally purge its chunks from DB")
+    src_rm.add_argument("path", type=str, help="File or directory path to unregister")
+    src_rm.add_argument("--keep-chunks", action="store_true", help="Do not delete chunks from vector database")
+    src_rm.add_argument("--json", action="store_true", help="Output in JSON format")
+
+    src_ls = src_sub.add_parser("list", aliases=["ls"], help="List all registered sources with existence and chunk counts")
+    src_ls.add_argument("-q", "--query", "--search", type=str, default=None, dest="query", help="Filter sources by keyword")
+    src_ls.add_argument("--json", action="store_true", help="Output in JSON format")
 
     # info / paths
     info_p = sub.add_parser("info", aliases=["paths"], help="Display Central Brain paths, configuration introspection, and active workspace map")
@@ -2607,8 +2971,9 @@ Examples:
     # list / ls
     list_p = sub.add_parser("list", aliases=["ls"], help="List facts, registered sources, discovered projects, or backups")
     list_p.add_argument("kind", nargs="?", default="facts", choices=["facts", "sources", "projects", "backups"], help="Type of items to list (default: facts)")
-    list_p.add_argument("-c", "--category", type=str, default=None, help="Filter facts by category")
-    list_p.add_argument("-e", "--entity", type=str, default=None, help="Filter facts by entity")
+    list_p.add_argument("-c", "--category", type=str, default=None, help="Filter facts by category (Fix, Rule, Knowledge, Project)")
+    list_p.add_argument("-e", "--entity", type=str, default=None, help="Filter facts by entity/topic")
+    list_p.add_argument("-q", "--query", "--search", type=str, default=None, dest="query", help="Filter items across all types by keyword/text")
     list_p.add_argument("-l", "--limit", type=int, default=25, help="Maximum number of items to display (default: 25)")
     list_p.add_argument("--json", action="store_true", help="Output in JSON format")
 
@@ -2627,18 +2992,24 @@ Examples:
     ip_cmd.add_argument("--json", action="store_true", help="Output in JSON format")
 
     # remember
-    r_p = sub.add_parser("remember", help="Save a memory or fact")
-    r_p.add_argument("fact", type=str, help="Fact or decision to remember")
-    r_p.add_argument("-e", "--entity", type=str, default="General", help="Entity or topic name")
-    r_p.add_argument("-c", "--category", type=str, default="Knowledge", help="Category (Knowledge/Fix/Rule/Project)")
-    r_p.add_argument("-s", "--source", type=str, default="CLI", help="Source agent/user")
+    r_p = sub.add_parser("remember", help="Save a verified discovery, solution, rule, or decision")
+    r_p.add_argument("fact", type=str, help="Verified fact, rule, or fix to persist")
+    r_p.add_argument("-e", "--entity", type=str, default="General", help="Entity or topic name (auto-detected if in project directory)")
+    r_p.add_argument("-c", "--category", type=str, default="Knowledge", help="Category: Knowledge (default), Fix, Rule, Project")
+    r_p.add_argument("--rule", action="store_true", help="Shortcut for --category Rule")
+    r_p.add_argument("--fix", action="store_true", help="Shortcut for --category Fix")
+    r_p.add_argument("--project", action="store_true", help="Shortcut for --category Project")
+    r_p.add_argument("--knowledge", action="store_true", help="Shortcut for --category Knowledge")
+    r_p.add_argument("-t", "--tags", type=str, default=None, metavar="TAGS", help="Comma-separated tags to append (e.g. 'wifi,driver,kernel')")
+    r_p.add_argument("-s", "--source", type=str, default="CLI", help="Source identifier (default: 'CLI')")
     r_p.add_argument("--json", action="store_true", help="Output in JSON format")
 
     # forget
     f_p = sub.add_parser("forget", help="Remove wrong or outdated memory from the central brain")
     f_p.add_argument("target", type=str, nargs="?", default=None, help="Search term/phrase of the fact to remove OR fact ID")
     f_p.add_argument("--id", type=int, default=None, help="Deterministic deletion by exact fact ID")
-    f_p.add_argument("-e", "--entity", type=str, default=None, help="Specific entity/topic filter")
+    f_p.add_argument("-e", "--entity", type=str, default=None, help="Filter deletion by entity/topic")
+    f_p.add_argument("-c", "--category", type=str, default=None, help="Filter deletion by category (Fix, Rule, Knowledge, Project)")
     f_p.add_argument("--json", action="store_true", help="Output in JSON format")
 
     # correct
@@ -2647,8 +3018,10 @@ Examples:
     c_p.add_argument("new_fact", type=str, nargs="?", default=None, help="The new, corrected fact or solution")
     c_p.add_argument("--id", type=int, default=None, help="Deterministic in-place update by exact fact ID")
     c_p.add_argument("-o", "--old", type=str, default=None, help="Old keyword or fact to replace")
-    c_p.add_argument("-c", "--category", type=str, default="Fix", help="Category (Fix/Rule/Knowledge/Project)")
-    c_p.add_argument("-s", "--source", type=str, default="CLI", help="Source agent/user")
+    c_p.add_argument("-c", "--category", type=str, default="Fix", help="Category: Fix (default), Rule, Knowledge, Project")
+    c_p.add_argument("--rule", action="store_true", help="Shortcut for --category Rule")
+    c_p.add_argument("--fix", action="store_true", help="Shortcut for --category Fix")
+    c_p.add_argument("-s", "--source", type=str, default="CLI", help="Source identifier (default: 'CLI')")
     c_p.add_argument("--json", action="store_true", help="Output in JSON format")
 
     # ingest
@@ -2662,6 +3035,7 @@ Examples:
 
     # prune
     p_p = sub.add_parser("prune", help="Clean deleted files, deduplicate facts, and reclaim disk space")
+    p_p.add_argument("--dry-run", action="store_true", help="Preview deletions without modifying database")
     p_p.add_argument("--json", action="store_true", help="Output in JSON format")
 
     # backup
@@ -2672,7 +3046,7 @@ Examples:
 
     # restore
     rst_p = sub.add_parser("restore", help="Restore Central Brain from a backup archive")
-    rst_p.add_argument("archive", type=str, help="Backup archive file (.tar.gz)")
+    rst_p.add_argument("archive", nargs="?", default="latest", help="Backup archive file (.tar.gz) or 'latest' (default: latest)")
     rst_p.add_argument("--force", action="store_true", help="Skip pre-restore safety snapshot")
     rst_p.add_argument("--json", action="store_true", help="Output in JSON format")
 
@@ -2697,9 +3071,22 @@ Examples:
     is_json = getattr(args, "json", False) or parser.get_default("json")
 
     if args.command in ["query", "search"]:
+        category = args.category
+        if getattr(args, "rule", False):
+            category = "Rule"
+        elif getattr(args, "fix", False):
+            category = "Fix"
+        elif getattr(args, "project", False):
+            category = "Project"
+        elif getattr(args, "knowledge", False):
+            category = "Knowledge"
+
+        top_k = args.limit if getattr(args, "limit", None) else args.top_k
         res = search_brain(
-            args.text, top_k=args.top_k, entity=args.entity, category=args.category,
-            source=args.source, since=args.since, until=args.until, path_filter=args.path
+            args.text, top_k=top_k, entity=args.entity, category=category,
+            source=args.source, since=args.since, until=args.until, path_filter=args.path,
+            facts_only=getattr(args, "facts_only", False),
+            chunks_only=getattr(args, "chunks_only", False)
         )
         is_compact = getattr(args, "compact", False)
         max_tokens = getattr(args, "max_tokens", None)
@@ -2748,6 +3135,32 @@ Examples:
                 print(apply_token_budget("\n".join(out_lines), max_tokens))
 
     elif args.command in ["state", "plan"]:
+        # Handle direct action / decision / blocker shortcuts if passed
+        action_text = getattr(args, "action", None)
+        decision_text = getattr(args, "decision", None)
+        blocker_text = getattr(args, "blocker", None)
+        if action_text:
+            ok, msg = state_add_entry(args.path, "action", action_text)
+            if is_json:
+                print(json.dumps({"status": "success" if ok else "error", "command": "state", "action": "add", "data": {"type": "action", "message": msg}}, indent=2))
+            else:
+                print(f"{'✅' if ok else '❌'} {msg}")
+            return
+        elif decision_text:
+            ok, msg = state_add_entry(args.path, "decision", decision_text)
+            if is_json:
+                print(json.dumps({"status": "success" if ok else "error", "command": "state", "action": "add", "data": {"type": "decision", "message": msg}}, indent=2))
+            else:
+                print(f"{'✅' if ok else '❌'} {msg}")
+            return
+        elif blocker_text:
+            ok, msg = state_add_entry(args.path, "blocker", blocker_text)
+            if is_json:
+                print(json.dumps({"status": "success" if ok else "error", "command": "state", "action": "add", "data": {"type": "blocker", "message": msg}}, indent=2))
+            else:
+                print(f"{'✅' if ok else '❌'} {msg}")
+            return
+
         # Handle state mutations if flags passed
         if getattr(args, "add", None):
             entry_type, text = args.add
@@ -3030,12 +3443,46 @@ Examples:
                 else:
                     print("⚠️  Some issues could not be resolved automatically. Review details above.\n")
 
+    elif args.command == "sources":
+        action = getattr(args, "sources_action", None) or "list"
+        if action == "add":
+            ok, msg, chunks = add_source(args.path)
+            if is_json:
+                print(json.dumps({"status": "success" if ok else "error", "command": "sources", "action": "add", "data": {"message": msg, "path": args.path, "chunks": chunks}}, indent=2))
+            else:
+                print(f"{'✅' if ok else '❌'} {msg}")
+        elif action in ["remove", "rm"]:
+            purge = not getattr(args, "keep_chunks", False)
+            ok, msg, purged = remove_source(args.path, purge_chunks=purge)
+            if is_json:
+                print(json.dumps({"status": "success" if ok else "error", "command": "sources", "action": "remove", "data": {"message": msg, "path": args.path, "purged_chunks": purged}}, indent=2))
+            else:
+                print(f"{'✅' if ok else '❌'} {msg}")
+        else:
+            # list
+            query = getattr(args, "query", None)
+            kind, items = list_brain_items("sources", query=query)
+            if is_json:
+                print(json.dumps({"status": "success", "command": "sources", "action": "list", "data": items, "count": len(items)}, indent=2))
+            else:
+                header_suffix = f" (Filter: '{query}')" if query else ""
+                print(f"\n📁 REGISTERED CENTRAL BRAIN SOURCES ({len(items)} entries{header_suffix})")
+                print("="*68)
+                if not items:
+                    print("  No registered sources found.")
+                for item in items:
+                    stat = "EXISTS" if item["exists"] else "MISSING"
+                    print(f"  • {item['path']:<45} [{stat}] ({item['type']}, {item['indexed_chunks']} chunks)")
+                print("="*68 + "\n")
+
     elif args.command in ["list", "ls"]:
-        kind, items = list_brain_items(args.kind, args.category, args.entity, args.limit)
+        query = getattr(args, "query", None)
+        kind, items = list_brain_items(args.kind, args.category, args.entity, args.limit, query=query)
         if is_json:
             print(json.dumps({"status": "success", "command": "list", "kind": kind, "data": items, "count": len(items)}, indent=2))
         else:
-            print(f"\n📋 CENTRAL BRAIN LIST: {kind.upper()} ({len(items)} items)")
+            header_suffix = f" (Filter: '{query}')" if query else ""
+            print(f"\n📋 CENTRAL BRAIN LIST: {kind.upper()} ({len(items)} items{header_suffix})")
             print("="*68)
             if kind == "facts":
                 if not items:
@@ -3079,11 +3526,25 @@ Examples:
             print(f"{'✅' if ok else '❌'} {msg}")
 
     elif args.command == "remember":
-        remember(args.fact, args.entity, args.category, args.source)
+        category = args.category
+        if getattr(args, "rule", False):
+            category = "Rule"
+        elif getattr(args, "fix", False):
+            category = "Fix"
+        elif getattr(args, "project", False):
+            category = "Project"
+        elif getattr(args, "knowledge", False):
+            category = "Knowledge"
+
+        tags_str = getattr(args, "tags", None)
+        tags_list = [t.strip() for t in tags_str.split(",") if t.strip()] if tags_str else None
+
+        remember(args.fact, args.entity, category, args.source, tags=tags_list)
         if is_json:
-            print(json.dumps({"status": "success", "command": "remember", "data": {"entity": args.entity, "category": args.category, "fact": args.fact, "source": args.source}}, indent=2))
+            print(json.dumps({"status": "success", "command": "remember", "data": {"entity": args.entity, "category": category, "fact": args.fact, "source": args.source, "tags": tags_list}}, indent=2))
         else:
-            print(f"✅ Saved memory to Central Brain: [{args.category}] ({args.entity}): {args.fact}")
+            tag_msg = f" (tags: {', '.join(tags_list)})" if tags_list else ""
+            print(f"✅ Saved memory to Central Brain: [{category}] ({args.entity}): {args.fact}{tag_msg}")
 
     elif args.command == "forget":
         fact_id = getattr(args, "id", None)
@@ -3092,9 +3553,10 @@ Examples:
             fact_id = int(re.match(r"^#?(\d+)$", target.strip()).group(1))
             target = None
 
-        cnt = forget(target, args.entity, fact_id=fact_id)
+        category = getattr(args, "category", None)
+        cnt = forget(target, args.entity, fact_id=fact_id, category=category)
         if is_json:
-            print(json.dumps({"status": "success", "command": "forget", "data": {"purged_count": cnt, "target": target, "id": fact_id, "entity": args.entity}}, indent=2))
+            print(json.dumps({"status": "success", "command": "forget", "data": {"purged_count": cnt, "target": target, "id": fact_id, "entity": args.entity, "category": category}}, indent=2))
         else:
             if fact_id is not None:
                 if cnt > 0:
@@ -3102,7 +3564,8 @@ Examples:
                 else:
                     print(f"❌ Central Brain: Fact #{fact_id} not found.")
             else:
-                print(f"🗑️ Central Brain: Purged {cnt} matching fact(s) matching '{target}' (Entity: {args.entity or 'Any'}).")
+                cat_info = f", Category: {category}" if category else ""
+                print(f"🗑️ Central Brain: Purged {cnt} matching fact(s) matching '{target}' (Entity: {args.entity or 'Any'}{cat_info}).")
 
     elif args.command == "correct":
         fact_id = getattr(args, "id", None)
@@ -3127,15 +3590,21 @@ Examples:
                 print(f"❌ {err}")
             return
 
-        ok = correct(entity, new_fact, args.old, args.category, args.source, fact_id=fact_id)
+        category = args.category
+        if getattr(args, "rule", False):
+            category = "Rule"
+        elif getattr(args, "fix", False):
+            category = "Fix"
+
+        ok = correct(entity, new_fact, args.old, category, args.source, fact_id=fact_id)
         if is_json:
-            print(json.dumps({"status": "success" if ok else "error", "command": "correct", "data": {"entity": entity, "category": args.category, "new_fact": new_fact, "id": fact_id, "source": args.source}}, indent=2))
+            print(json.dumps({"status": "success" if ok else "error", "command": "correct", "data": {"entity": entity, "category": category, "new_fact": new_fact, "id": fact_id, "source": args.source}}, indent=2))
         else:
             if ok:
                 if fact_id is not None:
                     print(f"✨ Central Brain: Successfully updated fact #{fact_id} -> {new_fact}")
                 else:
-                    print(f"✨ Central Brain: Successfully corrected memory for [{args.category}] ({entity}) -> {new_fact}")
+                    print(f"✨ Central Brain: Successfully corrected memory for [{category}] ({entity}) -> {new_fact}")
             else:
                 print(f"❌ Central Brain: Could not correct memory (fact not found).")
 
@@ -3163,11 +3632,15 @@ Examples:
             print(msg)
 
     elif args.command == "prune":
-        del_files, del_chunks = prune_brain()
+        is_dry = getattr(args, "dry_run", False)
+        del_files, del_chunks, dupe_facts = prune_brain(dry_run=is_dry)
         if is_json:
-            print(json.dumps({"status": "success", "command": "prune", "data": {"purged_files": del_files, "purged_chunks": del_chunks}}, indent=2))
+            print(json.dumps({"status": "success", "command": "prune", "data": {"dry_run": is_dry, "purged_files": del_files, "purged_chunks": del_chunks, "duplicate_facts": dupe_facts}}, indent=2))
         else:
-            print(f"🧹 Central Brain Prune Complete: Cleaned {del_files} deleted files ({del_chunks} chunks removed). Fact table deduplicated and database vacuumed.")
+            if is_dry:
+                print(f"🔍 Prune Preview (Dry Run): Found {del_files} deleted files ({del_chunks} orphan chunks) and {dupe_facts} duplicate facts eligible for removal.")
+            else:
+                print(f"🧹 Central Brain Prune Complete: Cleaned {del_files} deleted files ({del_chunks} chunks removed), deduplicated {dupe_facts} facts, and vacuumed database.")
 
     elif args.command == "backup":
         ok, msg, manifest = backup_brain(args.output, include_vault=not args.no_vault)
@@ -3177,9 +3650,10 @@ Examples:
             print(f"{'📦' if ok else '❌'} {msg}")
 
     elif args.command == "restore":
-        ok, msg = restore_brain(args.archive, force=args.force)
+        archive_target = getattr(args, "archive", "latest") or "latest"
+        ok, msg = restore_brain(archive_target, force=args.force)
         if is_json:
-            print(json.dumps({"status": "success" if ok else "error", "command": "restore", "data": {"message": msg}}, indent=2))
+            print(json.dumps({"status": "success" if ok else "error", "command": "restore", "data": {"message": msg, "target": str(archive_target)}}, indent=2))
         else:
             print(f"{'✅' if ok else '❌'} {msg}")
 
