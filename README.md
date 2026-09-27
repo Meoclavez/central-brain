@@ -10,7 +10,8 @@ Modern AI agents often suffer from fragmented context across different runtimes,
 * **Human-Readable Markdown Vault**: Plain `.md` files that can be inspected, edited, or tracked in git.
 * **Dense Vector RAG (Ollama `mxbai-embed-large`)**: 1024-dimensional local semantic embeddings.
 * **SQLite FTS5 Keyword Search**: Full-text keyword search with normalized BM25 scoring.
-* **Structured Fact Graph**: Entity-Attribute-Value memory store (`facts.json` & SQLite).
+* **Structured Fact Graph**: Entity-Attribute-Value memory store (`facts.json` & SQLite), ranked by hybrid vector + BM25 search.
+* **OKF Knowledge Bundle**: Facts and project maps compiled into an [Open Knowledge Format v0.2](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md) bundle (`~/.central_brain/okf/`) that any agent can `cat`, and a **Quick Map** (`brain quickmap`) that fuses OKF concept routing with RAG retrieval.
 * **Multi-Platform Protocols**: Native CLI (`brain`), Python SDK, and Model Context Protocol stdio server (`brain mcp`).
 
 ---
@@ -39,6 +40,7 @@ The design of **Central Brain** combines the best concepts from leading open-sou
 ├── projects/          # Codebase project maps, design specs, module indexes
 ├── episodes/          # Auto-generated daily work logs (YYYY-MM-DD.md)
 ├── backups/           # Point-in-time compressed snapshots (brain backup)
+├── okf/               # Generated OKF v0.2 bundle: index.md, log.md, projects/, topics/
 ├── db/
 │   └── brain.db       # Local SQLite Vector & FTS5 Database (WAL mode enabled)
 ├── facts.json         # Structured entity-fact graph (auto-synced)
@@ -74,7 +76,7 @@ brain info [project_path]
 brain info --paths
 brain info --json
 
-# Run 7-point health check across SQLite, Ollama, vector completeness, & registries
+# Run 8-point health check across SQLite, Ollama, vector completeness, registries, & OKF bundle
 brain doctor
 brain doctor --fix      # Automatically self-heal missing embeddings, dead sources, & FTS5
 
@@ -101,6 +103,21 @@ brain query "bluetooth" --terse --max-tokens 300
 
 # Precision filtered query (category shortcuts, entity, JSON output)
 brain query "bluetooth" --fix -e "MediaTek MT7921" --json
+
+# Quick map (RAG + OKF): ranked concepts, their best [#id] facts, docs, and related concepts
+brain quickmap "bluetooth audio stutters"
+brain qm "how is the vps deployed" -n 3 --max-tokens 600
+brain quickmap                      # inside a project: project map; elsewhere: bundle overview
+brain quickmap --all                # always the bundle overview
+
+# OKF knowledge bundle
+brain okf show                      # root index.md (progressive disclosure)
+brain okf show topics/realtek       # a group index, or a concept by id/title/entity
+brain okf set topics/realtek --status deprecated        # retire obsolete knowledge (demoted in quickmap)
+brain okf set "MediaTek MT7921 Combo Card" --stale-after 2026-12-31
+brain okf verify "MediaTek MT7921 Combo Card" --by human:meoclavezz
+brain okf validate ~/some/okf-bundle                     # OKF v0.2 §11 conformance check
+brain sources add ~/some/okf-bundle                      # external/authored OKF concepts join the map
 
 # Remember a new decision, rule, or fix across sessions (smart entity resolution + tags)
 brain remember "MediaTek MT7921 Wi-Fi stable on kernel 7.1.5+" --fix --tags "wifi,mt7921,kernel"
@@ -213,6 +230,35 @@ ollama run brain-agent
 
 ---
 
+## 🗺️ Quick Map: RAG + OKF
+
+`brain quickmap` answers "where is the knowledge about X, and how much can I trust it?" in one call.
+
+**How ranking works.** One query embedding is shared by three signals, then combined per concept:
+
+| Signal | Source | Weight |
+| :--- | :--- | :--- |
+| Concept card similarity | Embedding of title, description, tags, and fact text of each OKF concept | 0.35 |
+| Concept BM25 | `concepts_fts` over the same text (OR-of-prefix-terms query) | 0.15 |
+| Evidence | Best hybrid score of that concept's facts (vector + BM25 + phrase) or documents under its project | 0.50 |
+
+Lifecycle and trust from OKF frontmatter adjust the score: `deprecated` ×0.6, `draft` ×0.9, stale (`now >= stale_after`) ×0.85, human-reviewed ×1.1. Concepts below an absolute floor of 0.45 are dropped, so unrelated questions return nothing instead of noise.
+
+**What an agent gets back.** For each concept: type, concept id, fact count, trust tier, age, lifecycle flags, the facts most similar to the question (with `[#id]` for `brain correct --id`), document hits, and 1-hop related concepts. Facts and documents that do not belong to a chosen concept are listed separately.
+
+**The OKF bundle** (`~/.central_brain/okf/`) is regenerated automatically after `remember`, `correct`, `forget`, `sync`, and before `quickmap` when facts, overrides, or project maps changed. Nothing is rebuilt when nothing changed.
+
+* One concept per entity (spelling variants merge by slug). Entities that name or extend a known project go under `projects/<project>/`, together with an `overview.md` built from the project map or README. Other topics sharing a leading word are grouped (for example `topics/realtek/`, `topics/shopify/`).
+* Frontmatter follows OKF v0.2: `type`, `title`, `description`, `resource`, `tags`, `status`, `stale_after`, `generated`, `verified`, `sources`, plus the extensions `entities` and `fact_ids`.
+* `index.md` in every directory, a root `index.md` declaring `okf_version: "0.2"`, and a date-grouped `log.md` for the last 90 days.
+* Overrides from `brain okf set` and `brain okf verify` live in the database (`okf_meta`), so rebuilding never loses them.
+
+**Authored or external OKF bundles.** Any registered source containing markdown with a `type:` frontmatter key is read as OKF: the frontmatter is kept out of the chunk text, titles scope the chunk breadcrumbs, and trust, status, staleness, and markdown links feed the quick map. Write hand-authored concepts in `~/.central_brain/knowledge/`, because `okf/` is generated.
+
+**Schema compatibility.** v2.4 only adds tables (`facts_fts` with triggers, `fact_vectors`, `concepts`, `concepts_fts`, `okf_meta`, `brain_meta`), so older `brain.py` builds keep working on the same database.
+
+---
+
 ## 🐚 Shell Working Memory Persistence (`MEMORY_SETUP.md`)
 
 Central Brain includes a lightweight shell persistence layer (`helpers/00-osc-memory.sh` and `helpers/working_memory_template.sh`) documented in [`MEMORY_SETUP.md`](MEMORY_SETUP.md):
@@ -226,7 +272,9 @@ Central Brain includes a lightweight shell persistence layer (`helpers/00-osc-me
 ## 📊 Performance Benchmarks
 
 * **Idle RAM Overhead**: **0 MB** (No persistent background daemon).
-* **Query Latency**: **< 15 ms** over 1,500+ document chunks.
+* **Query Latency (CLI, median of 3)**: `brain query` 1.25 s and `brain quickmap` 1.27 s over 3,700 chunks and 290 facts, including process start-up and the Ollama query embedding. v2.3 `brain query` took 1.55 s on the same database. numpy is used for vector scoring when it is installed.
+* **Retrieval accuracy (v2.4, 15 natural-language fact queries)**: hit@5 went from 1/15 to 15/15. Multi-word queries used to need an exact substring match in the fact; now facts are ranked with vectors + BM25.
+* **Quick map routing (20 queries)**: the expected concept ranks first in 20/20.
 * **Disk Space**: **~35 MB** for 1,500+ chunks (500,000+ words across 300+ files).
 * **LLM Context Optimization**: Reduces LLM context window consumption by **90-95%** through targeted RAG retrieval.
 

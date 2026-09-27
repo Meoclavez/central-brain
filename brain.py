@@ -26,12 +26,22 @@ import shutil
 import argparse
 import urllib.request
 import urllib.error
+from urllib.parse import unquote
 import re
 import subprocess
 import platform
 import difflib
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
+
+try:  # Optional accelerators; Central Brain stays stdlib-only when they are missing.
+    import numpy as np
+except Exception:
+    np = None
+try:
+    import yaml
+except Exception:
+    yaml = None
 
 # Base Directory Setup
 BRAIN_DIR = Path(os.getenv("CENTRAL_BRAIN_DIR", os.getenv("BRAIN_DIR", Path.home() / ".central_brain"))).resolve()
@@ -44,10 +54,17 @@ FACTS_PATH = BRAIN_DIR / "facts.json"
 SOURCES_PATH = BRAIN_DIR / "sources.json"
 SYSTEM_PROMPT_PATH = BRAIN_DIR / "SYSTEM_PROMPT.md"
 BACKUP_DIR = BRAIN_DIR / "backups"
+OKF_DIR = BRAIN_DIR / "okf"
+
+BRAIN_VERSION = "2.4.0"
+OKF_VERSION = "0.2"
+OKF_PRODUCER = f"central-brain/{BRAIN_VERSION}"
+OKF_BUILD_REV = "1"  # bump when bundle rendering changes so existing bundles regenerate
 
 OLLAMA_EMBED_URL = "http://localhost:11434/api/embed"
 DEFAULT_EMBED_MODEL = "mxbai-embed-large"
 EMBED_BATCH_SIZE = 32
+_OLLAMA_UNREACHABLE = False
 
 def ensure_dirs():
     for d in [BRAIN_DIR, KNOWLEDGE_DIR, PROJECTS_DIR, EPISODES_DIR, DB_DIR, BACKUP_DIR]:
@@ -123,6 +140,7 @@ def get_db():
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_facts_entity_cat ON facts(entity, category, timestamp);")
+        migrate_schema_v24(conn)
 
         # Self-healing rehydration: If facts table is empty but facts.json has entries, restore them!
         try:
@@ -140,6 +158,81 @@ def get_db():
         except Exception:
             pass
     return conn
+
+def migrate_schema_v24(conn):
+    """Additive v2.4 schema: facts FTS5, fact vectors, OKF concepts, and metadata.
+    Only creates new objects, so older brain.py versions keep working on the same DB."""
+    has_facts_fts = conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'facts_fts'").fetchone()
+    conn.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
+            entity, category, fact, content='facts', content_rowid='id'
+        )
+    """)
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN
+            INSERT INTO facts_fts(rowid, entity, category, fact) VALUES (new.id, new.entity, new.category, new.fact);
+        END;
+    """)
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS facts_ad AFTER DELETE ON facts BEGIN
+            INSERT INTO facts_fts(facts_fts, rowid, entity, category, fact) VALUES('delete', old.id, old.entity, old.category, old.fact);
+        END;
+    """)
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS facts_au AFTER UPDATE ON facts BEGIN
+            INSERT INTO facts_fts(facts_fts, rowid, entity, category, fact) VALUES('delete', old.id, old.entity, old.category, old.fact);
+            INSERT INTO facts_fts(rowid, entity, category, fact) VALUES (new.id, new.entity, new.category, new.fact);
+        END;
+    """)
+    if not has_facts_fts:
+        conn.execute("INSERT INTO facts_fts(facts_fts) VALUES('rebuild');")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS fact_vectors (
+            fact_id INTEGER PRIMARY KEY,
+            hash TEXT NOT NULL,
+            embedding BLOB NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS concepts (
+            key TEXT PRIMARY KEY,
+            origin TEXT NOT NULL,
+            bundle TEXT NOT NULL,
+            concept_id TEXT NOT NULL,
+            file_path TEXT,
+            type TEXT,
+            title TEXT,
+            description TEXT,
+            tags TEXT,
+            status TEXT,
+            stale_after TEXT,
+            trust TEXT,
+            generated_at TEXT,
+            resource TEXT,
+            links TEXT,
+            entities TEXT,
+            fact_ids TEXT,
+            card TEXT,
+            card_hash TEXT,
+            embedding BLOB,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_concepts_file ON concepts(file_path);")
+    conn.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS concepts_fts USING fts5(
+            key UNINDEXED, title, description, tags, body
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS okf_meta (
+            slug TEXT PRIMARY KEY,
+            data TEXT NOT NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute("CREATE TABLE IF NOT EXISTS brain_meta (key TEXT PRIMARY KEY, value TEXT)")
 
 def encode_vector_blob(vec: list[float]) -> bytes:
     """Packs float vector into compact binary IEEE 754 float32 blob."""
@@ -166,8 +259,11 @@ def decode_vector_blob(blob: bytes) -> list[float]:
 
 def get_embeddings_batch(texts: list[str], model: str = DEFAULT_EMBED_MODEL, max_retries: int = 3) -> list[list[float] | None]:
     """High-performance batch embedding via Ollama /api/embed endpoint with automatic truncation."""
+    global _OLLAMA_UNREACHABLE
     if not texts:
         return []
+    if _OLLAMA_UNREACHABLE:
+        return [None] * len(texts)
     cleaned_texts = [t.strip() if t and t.strip() else " " for t in texts]
 
     for attempt in range(max_retries):
@@ -187,6 +283,8 @@ def get_embeddings_batch(texts: list[str], model: str = DEFAULT_EMBED_MODEL, max
                 time.sleep(0.2 * (attempt + 1))
             else:
                 print(f"[Brain Warning] Ollama batch embedding failed ({e}). Falling back to keyword search.", file=sys.stderr)
+                if isinstance(e, urllib.error.URLError) and not isinstance(e, urllib.error.HTTPError):
+                    _OLLAMA_UNREACHABLE = True  # daemon down: skip further attempts in this process
     return [None] * len(texts)
 
 def get_embedding(text: str, model: str = DEFAULT_EMBED_MODEL) -> list[float] | None:
@@ -203,6 +301,269 @@ def cosine_similarity(v1, v2):
     norm1 = math.sqrt(sum(a * a for a in v1))
     norm2 = math.sqrt(sum(b * b for b in v2))
     return dot / (norm1 * norm2) if norm1 and norm2 else 0.0
+
+def batch_cosine(query_vec: list[float], blobs: list) -> list[float]:
+    """Cosine similarity of one query against many stored vector blobs (numpy-accelerated when available)."""
+    if not query_vec or not blobs:
+        return [0.0] * len(blobs)
+    dim = len(query_vec)
+    if np is not None:
+        q = np.asarray(query_vec, dtype=np.float32)
+        qn = float(np.linalg.norm(q)) or 1.0
+        out = []
+        for blob in blobs:
+            if isinstance(blob, (bytes, bytearray, memoryview)) and len(blob) == dim * 4:
+                v = np.frombuffer(blob, dtype=np.float32)
+            else:
+                dec = decode_vector_blob(blob)
+                if len(dec) != dim:
+                    out.append(0.0)
+                    continue
+                v = np.asarray(dec, dtype=np.float32)
+            vn = float(np.linalg.norm(v))
+            out.append(float(q @ v) / (qn * vn) if vn else 0.0)
+        return out
+    return [cosine_similarity(query_vec, decode_vector_blob(b)) for b in blobs]
+
+FTS_STOPWORDS = {
+    "a", "an", "the", "and", "or", "but", "of", "to", "in", "on", "at", "for", "with", "by", "from", "as",
+    "is", "are", "was", "were", "be", "been", "it", "its", "this", "that", "these", "those", "there",
+    "i", "me", "my", "we", "our", "you", "your", "do", "does", "did", "how", "what", "which", "who", "whom",
+    "why", "when", "where", "can", "could", "should", "would", "will", "shall", "may", "might", "must",
+    "not", "no", "yes", "so", "if", "then", "than", "into", "about", "up", "out", "now", "get", "use", "using"
+}
+
+def build_fts_query(text: str) -> str | None:
+    """Converts free text into an FTS5 OR-query of prefix terms (BM25 ranks docs matching more/rarer terms higher).
+    Plain AND matching (the old behaviour) returned nothing for most natural-language questions."""
+    if not text:
+        return None
+    tokens = re.findall(r"[A-Za-z0-9_]+", text.lower())
+    terms = []
+    for t in tokens:
+        if len(t) < 2 or t in FTS_STOPWORDS or t in terms:
+            continue
+        terms.append(t)
+    if not terms:
+        return None
+    return " OR ".join(f'"{t}"*' for t in terms[:16])
+
+def slugify(text: str) -> str:
+    """Filesystem- and URL-safe concept slug ('Realtek RTL8852BE Wi-Fi' -> 'realtek-rtl8852be-wi-fi')."""
+    s = re.sub(r"[^a-z0-9]+", "-", str(text or "").lower()).strip("-")
+    return s[:80] or "general"
+
+def to_iso_utc(ts) -> str | None:
+    """Normalizes SQLite CURRENT_TIMESTAMP (UTC) or ISO strings to ISO 8601 with an explicit UTC offset."""
+    if not ts:
+        return None
+    if isinstance(ts, datetime):
+        dt = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    raw = str(ts).strip()
+    try:
+        if re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", raw):
+            dt = datetime.strptime(raw[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        else:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.astimezone()  # naive isoformat() values were written in local time
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        return None
+
+def parse_iso(ts) -> datetime | None:
+    iso = to_iso_utc(ts)
+    if not iso:
+        return None
+    return datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+FRONTMATTER_RE = re.compile(r"\A---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)", re.DOTALL)
+
+def _mini_yaml_scalar(raw: str):
+    raw = raw.strip()
+    if raw == "":
+        return None
+    if raw[0] == '"' and raw[-1] == '"' and len(raw) >= 2:
+        try:
+            return json.loads(raw)
+        except Exception:
+            return raw[1:-1]
+    if raw[0] == "'" and raw[-1] == "'" and len(raw) >= 2:
+        return raw[1:-1].replace("''", "'")
+    if raw.startswith("[") and raw.endswith("]"):
+        inner = raw[1:-1].strip()
+        return [_mini_yaml_scalar(x) for x in _split_flow(inner)] if inner else []
+    if raw.startswith("{") and raw.endswith("}"):
+        out = {}
+        for part in _split_flow(raw[1:-1]):
+            if ":" in part:
+                k, v = part.split(":", 1)
+                out[k.strip()] = _mini_yaml_scalar(v)
+        return out
+    low = raw.lower()
+    if low in ("true", "yes"):
+        return True
+    if low in ("false", "no"):
+        return False
+    if low in ("null", "~"):
+        return None
+    if re.fullmatch(r"-?\d+", raw):
+        return int(raw)
+    if re.fullmatch(r"-?\d+\.\d+", raw):
+        return float(raw)
+    return raw
+
+def _split_flow(text: str) -> list[str]:
+    parts, depth, cur, quote, escaped = [], 0, [], None, False
+    for ch in text:
+        if quote:
+            cur.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\" and quote == '"':
+                escaped = True
+            elif ch == quote:
+                quote = None
+            continue
+        if ch in "\"'":
+            quote = ch
+        elif ch in "[{":
+            depth += 1
+        elif ch in "]}":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append("".join(cur).strip())
+            cur = []
+            continue
+        cur.append(ch)
+    if "".join(cur).strip():
+        parts.append("".join(cur).strip())
+    return parts
+
+def _mini_yaml_load(text: str) -> dict:
+    """Minimal YAML subset loader (OKF frontmatter shapes) used when PyYAML is unavailable:
+    scalars, flow lists/maps, block lists of scalars or maps, and one level of nested maps."""
+    root = {}
+    lines = [l.rstrip() for l in text.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        m = re.match(r"^([A-Za-z0-9_\-]+):\s*(.*)$", line)
+        if not m or line.startswith(" "):
+            i += 1
+            continue
+        key, rest = m.group(1), m.group(2)
+        i += 1
+        if rest.strip():
+            root[key] = _mini_yaml_scalar(rest)
+            continue
+        block = []
+        while i < len(lines) and (lines[i].startswith(" ") or lines[i].startswith("-")):
+            block.append(lines[i])
+            i += 1
+        if block and block[0].lstrip().startswith("-"):
+            items, current = [], None
+            for b in block:
+                st = b.strip()
+                if st.startswith("- ") or st == "-":
+                    if current is not None:
+                        items.append(current)
+                    body = st[1:].strip()
+                    km = re.match(r"^([A-Za-z0-9_\-]+):\s*(.*)$", body)
+                    if km and not body.startswith(("{", "[", "\"", "'")):
+                        current = {km.group(1): _mini_yaml_scalar(km.group(2))}
+                    else:
+                        current = _mini_yaml_scalar(body)
+                else:
+                    km = re.match(r"^([A-Za-z0-9_\-]+):\s*(.*)$", st)
+                    if km and isinstance(current, dict):
+                        current[km.group(1)] = _mini_yaml_scalar(km.group(2))
+            if current is not None:
+                items.append(current)
+            root[key] = items
+        else:
+            sub = {}
+            for b in block:
+                km = re.match(r"^\s+([A-Za-z0-9_\-]+):\s*(.*)$", b)
+                if km:
+                    sub[km.group(1)] = _mini_yaml_scalar(km.group(2))
+            root[key] = sub
+    return root
+
+def _normalize_yaml_values(obj):
+    if isinstance(obj, dict):
+        return {str(k): _normalize_yaml_values(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_normalize_yaml_values(v) for v in obj]
+    if isinstance(obj, datetime):
+        return to_iso_utc(obj)
+    if hasattr(obj, "isoformat") and not isinstance(obj, str):
+        return obj.isoformat()
+    return obj
+
+def parse_frontmatter(content: str) -> tuple[dict | None, str]:
+    """Splits a markdown document into (frontmatter dict or None, body)."""
+    if not content or not content.startswith("---"):
+        return None, content
+    m = FRONTMATTER_RE.match(content)
+    if not m:
+        return None, content
+    raw = m.group(1)
+    meta = None
+    if yaml is not None:
+        try:
+            loaded = yaml.safe_load(raw)
+            meta = loaded if isinstance(loaded, dict) else None
+        except Exception:
+            meta = None
+    if meta is None:
+        try:
+            meta = _mini_yaml_load(raw)
+        except Exception:
+            meta = None
+    if meta is None:
+        return None, content
+    return _normalize_yaml_values(meta), content[m.end():]
+
+def _yaml_scalar(v) -> str:
+    if v is None:
+        return "null"
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
+    s = str(v)
+    if re.fullmatch(r"[-+]?[0-9][0-9_.:eE+-]*", s):
+        return json.dumps(s)
+    if s == "" or re.search(r"[:#\[\]{},&*!|>'\"%@`]|^[-?\s]|\s$", s) or s.lower() in ("true", "false", "null", "yes", "no", "~"):
+        return json.dumps(s, ensure_ascii=False)
+    return s
+
+def dump_frontmatter(meta: dict) -> str:
+    """Deterministic YAML emitter for OKF frontmatter (flow style for short maps/lists)."""
+    out = ["---"]
+    for key, val in meta.items():
+        if val is None or val == [] or val == {}:
+            continue
+        if isinstance(val, dict):
+            out.append(f"{key}: {{ " + ", ".join(f"{k}: {_yaml_scalar(v)}" for k, v in val.items()) + " }")
+        elif isinstance(val, list) and val and all(isinstance(x, dict) for x in val):
+            out.append(f"{key}:")
+            for item in val:
+                if len(item) <= 2:
+                    out.append("  - { " + ", ".join(f"{k}: {_yaml_scalar(v)}" for k, v in item.items()) + " }")
+                else:
+                    first = True
+                    for k, v in item.items():
+                        out.append(f"  {'- ' if first else '  '}{k}: {_yaml_scalar(v)}")
+                        first = False
+        elif isinstance(val, list):
+            out.append(f"{key}: [" + ", ".join(_yaml_scalar(x) for x in val) + "]")
+        else:
+            out.append(f"{key}: {_yaml_scalar(val)}")
+    out.append("---")
+    return "\n".join(out) + "\n"
 
 def split_oversized_text(text: str, max_chars: int, overlap_chars: int) -> list[str]:
     paragraphs = text.split("\n\n")
@@ -305,9 +666,22 @@ def chunk_markdown(content: str, file_path: str, max_chunk_chars: int = 2400, ov
 
     return final_chunks
 
+def is_generated_okf_path(path: Path) -> bool:
+    """True for files inside the generated OKF bundle (~/.central_brain/okf), which mirrors the facts store."""
+    try:
+        Path(path).resolve().relative_to(OKF_DIR.resolve())
+        return True
+    except ValueError:
+        return False
+
+def is_okf_concept(file_path: Path, meta: dict | None) -> bool:
+    return bool(meta) and bool(str(meta.get("type") or "").strip()) and file_path.name not in ("index.md", "log.md")
+
 def ingest_file(file_path: Path):
     file_path = file_path.resolve()
     if not file_path.exists() or file_path.suffix.lower() not in ['.md', '.txt', '.json', '.conf', '.sh']:
+        return 0
+    if is_generated_okf_path(file_path):
         return 0
 
     try:
@@ -320,15 +694,35 @@ def ingest_file(file_path: Path):
     str_path = str(file_path)
     file_content_hash = hashlib.sha256(content.encode('utf-8')).hexdigest()
 
+    meta, body = parse_frontmatter(content) if file_path.suffix.lower() == ".md" else (None, content)
+    okf_concept = is_okf_concept(file_path, meta)
+
     existing = conn.execute("SELECT COUNT(*), hash FROM chunks WHERE file_path = ?", (str_path,)).fetchall()
     if existing and existing[0][0] > 0:
         first_hash = existing[0][1] or ""
         if first_hash.startswith(f"{file_content_hash}:"):
             null_embeds = conn.execute("SELECT COUNT(*) FROM chunks WHERE file_path = ? AND embedding IS NULL", (str_path,)).fetchone()[0]
             if null_embeds == 0:
+                if okf_concept and not conn.execute("SELECT 1 FROM concepts WHERE key = ?", (f"file:{str_path}",)).fetchone():
+                    with conn:
+                        register_file_concept(conn, file_path, meta, body)
                 return existing[0][0]
 
-    chunks = chunk_markdown(content, str_path)
+    if okf_concept:
+        # OKF concept: index the body only (YAML is noise for BM25/vectors) and scope breadcrumbs by title.
+        title = str(meta.get("title") or file_path.stem)
+        chunks = []
+        for idx, (header, text) in enumerate(chunk_markdown(body, str_path)):
+            scoped = title if header == file_path.name else f"{title} > {header}"
+            if idx == 0 and meta.get("description"):
+                text = f"{meta['description']}\n\n{text}"
+            chunks.append((scoped, text))
+        if not chunks and meta.get("description"):
+            chunks = [(title, str(meta["description"]))]
+    elif meta and meta.get("okf_version"):
+        chunks = chunk_markdown(body, str_path)  # OKF bundle-root index.md: skip the version frontmatter
+    else:
+        chunks = chunk_markdown(content, str_path)
     if not chunks:
         return 0
 
@@ -351,6 +745,11 @@ def ingest_file(file_path: Path):
                 (str_path, header, chunk_text, vec_blob, chunk_hash)
             )
             ingested_count += 1
+        if okf_concept:
+            register_file_concept(conn, file_path, meta, body)
+        else:
+            conn.execute("DELETE FROM concepts WHERE key = ?", (f"file:{str_path}",))
+            conn.execute("DELETE FROM concepts_fts WHERE key = ?", (f"file:{str_path}",))
 
     return ingested_count
 
@@ -453,6 +852,7 @@ def remember(fact: str, entity: str = None, category: str = "Knowledge", source:
         f.write(f"- [{time_str}] **[{category}]** ({entity}): {fact} (via {source})\n")
 
     ingest_file(today_file)
+    okf_refresh_quiet()
     return True
 
 def forget(target: str = None, entity: str = None, fact_id: int = None, category: str = None):
@@ -507,6 +907,7 @@ def forget(target: str = None, entity: str = None, fact_id: int = None, category
         f.write(f"- [{time_str}] **[Invalidated/Forgotten]** Purged {purged_info}\n")
 
     ingest_file(today_file)
+    okf_refresh_quiet()
     return deleted_count
 
 def correct(entity: str = None, new_fact: str = None, old_fact_search: str = None, category: str = "Fix", source: str = "CLI", fact_id: int = None):
@@ -566,6 +967,7 @@ def correct(entity: str = None, new_fact: str = None, old_fact_search: str = Non
             f.write(f"- [{time_str}] **[Correction]** ({entity}): {new_fact}{old_info}\n")
 
     ingest_file(today_file)
+    okf_refresh_quiet()
     return True
 
 def calculate_recency_and_category_boost(doc: dict) -> float:
@@ -602,22 +1004,118 @@ def calculate_recency_and_category_boost(doc: dict) -> float:
 
     return boost
 
+FACT_SIM_FLOOR = 0.52      # cosine floor for a vector-only fact match (mxbai-embed-large; unrelated text sits ~0.35-0.48)
+FACT_RELATIVE_FLOOR = 0.55  # drop facts scoring below this fraction of the best fact
+
+def fact_embed_text(entity: str, fact: str) -> str:
+    return f"{entity or 'General'}: {fact or ''}"
+
+def ensure_fact_vectors(conn=None, force_check: bool = True) -> int:
+    """Embeds facts that have no (or an outdated) vector. Returns the number of facts embedded.
+    Hash-keyed, so corrections made by any brain version are re-embedded on the next query or sync."""
+    conn = conn or get_db()
+    rows = conn.execute("SELECT id, entity, fact FROM facts").fetchall()
+    have = {r[0]: r[1] for r in conn.execute("SELECT fact_id, hash FROM fact_vectors").fetchall()}
+    live_ids = set()
+    todo = []
+    for r in rows:
+        live_ids.add(r["id"])
+        h = hashlib.sha1(fact_embed_text(r["entity"], r["fact"]).encode("utf-8")).hexdigest()
+        if have.get(r["id"]) != h:
+            todo.append((r["id"], h, fact_embed_text(r["entity"], r["fact"])))
+    stale = [fid for fid in have if fid not in live_ids]
+    if stale:
+        with conn:
+            conn.executemany("DELETE FROM fact_vectors WHERE fact_id = ?", [(fid,) for fid in stale])
+    embedded = 0
+    for i in range(0, len(todo), EMBED_BATCH_SIZE):
+        batch = todo[i:i + EMBED_BATCH_SIZE]
+        vecs = get_embeddings_batch([t[2] for t in batch])
+        if not any(vecs):
+            break
+        with conn:
+            for (fid, h, _), vec in zip(batch, vecs):
+                if vec:
+                    conn.execute("INSERT OR REPLACE INTO fact_vectors (fact_id, hash, embedding) VALUES (?, ?, ?)",
+                                 (fid, h, encode_vector_blob(vec)))
+                    embedded += 1
+    return embedded
+
+def rank_facts(conn, query: str, query_vec: list[float] | None, conds: list[str], params: list, limit: int) -> list[dict]:
+    """Hybrid fact ranking: 0.7 * vector cosine + 0.3 * BM25 reciprocal rank + exact-phrase bonus.
+    conds/params are SQL filters over alias 'f' (the facts table)."""
+    where_extra = (" AND " + " AND ".join(conds)) if conds else ""
+    kw_scores = {}
+    fts_q = build_fts_query(query)
+    if fts_q:
+        try:
+            rows = conn.execute(
+                f"SELECT f.id FROM facts_fts JOIN facts f ON f.id = facts_fts.rowid "
+                f"WHERE facts_fts MATCH ?{where_extra} ORDER BY bm25(facts_fts) LIMIT 50",
+                [fts_q, *params]
+            ).fetchall()
+            for rank_idx, r in enumerate(rows):
+                kw_scores[r[0]] = 1.0 / (rank_idx + 1)
+        except sqlite3.Error:
+            pass
+
+    phrase_ids = {r[0] for r in conn.execute(
+        f"SELECT f.id FROM facts f WHERE (f.fact LIKE ? OR f.entity LIKE ?){where_extra}",
+        [f"%{query}%", f"%{query}%", *params]
+    ).fetchall()}
+
+    vec_scores = {}
+    if query_vec:
+        ensure_fact_vectors(conn)
+        rows = conn.execute(
+            f"SELECT f.id, v.embedding FROM facts f JOIN fact_vectors v ON v.fact_id = f.id WHERE 1=1{where_extra}",
+            params
+        ).fetchall()
+        for r, sim in zip(rows, batch_cosine(query_vec, [r[1] for r in rows])):
+            vec_scores[r[0]] = sim
+
+    scored = []
+    for fid in set(kw_scores) | set(phrase_ids) | set(vec_scores):
+        sim = vec_scores.get(fid, 0.0)
+        kw = kw_scores.get(fid, 0.0)
+        phrase = fid in phrase_ids
+        if query_vec and not phrase and sim < FACT_SIM_FLOOR and kw < 0.2:
+            continue
+        score = 0.7 * sim + 0.3 * kw + (0.15 if phrase else 0.0)
+        if not query_vec:
+            score = kw + (0.5 if phrase else 0.0)
+        scored.append((score, fid))
+    if not scored:
+        return []
+    scored.sort(reverse=True)
+    best = scored[0][0]
+    keep = [(sc, fid) for sc, fid in scored if sc >= best * FACT_RELATIVE_FLOOR][:limit]
+    out = []
+    for sc, fid in keep:
+        row = conn.execute("SELECT id, entity, category, fact, source, timestamp FROM facts WHERE id = ?", (fid,)).fetchone()
+        if row:
+            out.append({**dict(row), "score": round(sc, 4)})
+    return out
+
 def search_brain(query: str, top_k: int = 5, entity: str = None, category: str = None,
                  source: str = None, since: str = None, until: str = None, path_filter: str = None,
-                 facts_only: bool = False, chunks_only: bool = False):
+                 facts_only: bool = False, chunks_only: bool = False, query_vec: list[float] = None):
     """
     Recency-weighted Hybrid Search across Vectors, FTS5 Keywords, and Structured Facts.
     Supports multi-field precision filtering and selective retrieval (facts_only / chunks_only).
+    Pass query_vec to reuse an embedding computed by the caller (one Ollama call per search).
     """
     conn = get_db()
     cat_map = {"fix": "Fix", "rule": "Rule", "knowledge": "Knowledge", "project": "Project"}
     if category:
         category = cat_map.get(str(category).lower(), category)
 
+    if query and query_vec is None:
+        query_vec = get_embedding(query)
+
     # 1. Dense Vector & FTS5 Search (skipped if facts_only)
     top_docs = []
     if not facts_only:
-        query_vec = get_embedding(query) if query else None
         vector_results = []
         if query_vec:
             sql = "SELECT id, file_path, header, content, embedding, updated_at FROM chunks WHERE embedding IS NOT NULL"
@@ -626,27 +1124,27 @@ def search_brain(query: str, top_k: int = 5, entity: str = None, category: str =
                 sql += " AND file_path LIKE ?"
                 params.append(f"%{path_filter}%")
             rows = conn.execute(sql, params).fetchall()
-            for r in rows:
-                vec = decode_vector_blob(r['embedding'])
-                sim = cosine_similarity(query_vec, vec)
-                vector_results.append((sim, dict(r)))
+            sims = batch_cosine(query_vec, [r['embedding'] for r in rows])
+            for r, sim in zip(rows, sims):
+                d = dict(r)
+                d.pop("embedding", None)
+                vector_results.append((sim, d))
             vector_results.sort(key=lambda x: x[0], reverse=True)
 
-        # 2. FTS5 Keyword Search
+        # 2. FTS5 Keyword Search (OR of prefix terms, BM25-ranked)
         fts_results = {}
-        if query:
+        fts_q = build_fts_query(query)
+        if fts_q:
             try:
-                clean_q = "".join([c if c.isalnum() or c.isspace() else " " for c in query]).strip()
-                if clean_q:
-                    sql = "SELECT rowid as id, file_path, header, content, rank, updated_at FROM chunks_fts WHERE chunks_fts MATCH ?"
-                    params = [clean_q]
-                    if path_filter:
-                        sql += " AND file_path LIKE ?"
-                        params.append(f"%{path_filter}%")
-                    sql += " ORDER BY rank LIMIT 25"
-                    fts_rows = conn.execute(sql, params).fetchall()
-                    for rank_idx, r in enumerate(fts_rows):
-                        fts_results[r['id']] = 1.0 / (rank_idx + 1)
+                sql = "SELECT rowid as id FROM chunks_fts WHERE chunks_fts MATCH ?"
+                params = [fts_q]
+                if path_filter:
+                    sql += " AND file_path LIKE ?"
+                    params.append(f"%{path_filter}%")
+                sql += " ORDER BY rank LIMIT 25"
+                fts_rows = conn.execute(sql, params).fetchall()
+                for rank_idx, r in enumerate(fts_rows):
+                    fts_results[r['id']] = 1.0 / (rank_idx + 1)
             except Exception:
                 pass
 
@@ -682,35 +1180,1057 @@ def search_brain(query: str, top_k: int = 5, entity: str = None, category: str =
     if not chunks_only:
         fact_conditions = []
         fact_params = []
-        if query:
-            fact_conditions.append("(fact LIKE ? OR entity LIKE ?)")
-            fact_params.extend([f"%{query}%", f"%{query}%"])
         if entity:
-            fact_conditions.append("entity = ? COLLATE NOCASE")
+            fact_conditions.append("f.entity = ? COLLATE NOCASE")
             fact_params.append(entity)
         if category:
-            fact_conditions.append("category = ? COLLATE NOCASE")
+            fact_conditions.append("f.category = ? COLLATE NOCASE")
             fact_params.append(category)
         if source:
-            fact_conditions.append("source = ? COLLATE NOCASE")
+            fact_conditions.append("f.source = ? COLLATE NOCASE")
             fact_params.append(source)
         if since:
-            fact_conditions.append("timestamp >= ?")
+            fact_conditions.append("f.timestamp >= ?")
             fact_params.append(since)
         if until:
-            fact_conditions.append("timestamp <= ?")
+            fact_conditions.append("f.timestamp <= ?")
             fact_params.append(until)
 
-        where_sql = " AND ".join(fact_conditions) if fact_conditions else "1=1"
-        facts_rows = conn.execute(
-            f"SELECT id, entity, category, fact, source, timestamp FROM facts WHERE {where_sql} ORDER BY id DESC LIMIT ?",
-            (*fact_params, top_k)
-        ).fetchall()
+        if query:
+            facts_rows = rank_facts(conn, query, query_vec, fact_conditions, fact_params, top_k)
+        else:
+            where_sql = " AND ".join(fact_conditions) if fact_conditions else "1=1"
+            facts_rows = [dict(r) for r in conn.execute(
+                f"SELECT f.id, f.entity, f.category, f.fact, f.source, f.timestamp FROM facts f WHERE {where_sql} ORDER BY f.id DESC LIMIT ?",
+                (*fact_params, top_k)
+            ).fetchall()]
 
     return {
         "chunks": [{"score": round(score, 4), **{k: v for k, v in doc.items() if k != 'embedding'}} for score, doc in top_docs],
-        "facts": [dict(f) for f in facts_rows]
+        "facts": facts_rows
     }
+
+# ============================================================================
+# OKF (Open Knowledge Format v0.2) Knowledge Bundle & Quick Map
+#   Producer: compiles the facts store + project maps into ~/.central_brain/okf/
+#             (index.md progressive disclosure, one concept per entity, log.md).
+#   Consumer: any registered source containing OKF concepts (frontmatter with
+#             `type:`) is parsed into the concepts table with trust/lifecycle.
+#   Quick map: concept-level routing (OKF) fused with chunk/fact retrieval (RAG).
+# ============================================================================
+
+FACT_SECTIONS = [("Rule", "Rules"), ("Fix", "Fixes"), ("Knowledge", "Knowledge"), ("Project", "Project Log")]
+QM_W_CARD, QM_W_FTS, QM_W_EVIDENCE = 0.35, 0.15, 0.5  # concept score = card cosine + concept BM25 + best fact/chunk evidence
+QM_MIN_SCORE = 0.45  # absolute concept floor (measured: real queries top out >= 0.7, off-topic queries <= 0.38)
+QUICKMAP_OTHER_FACT_FLOOR = 0.55
+QM_DOC_FLOOR = 0.55  # chunk hybrid score floor for evidence/documents (off-topic chunks measured <= 0.50)  # facts outside the chosen concepts must clear this hybrid score to be listed
+GENERIC_GROUP_TOKENS = {"the", "new", "fix", "fixes", "general", "system", "project", "universal", "standalone", "multi"}
+
+def okf_trust_tier(verified) -> str:
+    """OKF §5.3: no verified => unverified; human:<id> actor => human-reviewed; else machine-confirmed."""
+    if not verified:
+        return "unverified"
+    items = verified if isinstance(verified, list) else [verified]
+    actors = [str(v.get("by", "")) for v in items if isinstance(v, dict)]
+    if any(a.startswith("human:") for a in actors):
+        return "human-reviewed"
+    return "machine-confirmed" if actors else "unverified"
+
+def okf_is_stale(stale_after, now: datetime = None) -> bool:
+    dt = parse_iso(stale_after)
+    return bool(dt) and (now or datetime.now(timezone.utc)) >= dt
+
+def load_sources_list() -> list[str]:
+    if SOURCES_PATH.exists():
+        try:
+            with open(SOURCES_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return [str(x) for x in data] if isinstance(data, list) else []
+        except Exception:
+            return []
+    return []
+
+def get_okf_meta(conn) -> dict:
+    out = {}
+    for r in conn.execute("SELECT slug, data FROM okf_meta").fetchall():
+        try:
+            out[r[0]] = json.loads(r[1])
+        except Exception:
+            pass
+    return out
+
+def set_okf_meta(conn, slug: str, updates: dict) -> dict:
+    row = conn.execute("SELECT data FROM okf_meta WHERE slug = ?", (slug,)).fetchone()
+    data = json.loads(row[0]) if row else {}
+    for k, v in updates.items():
+        if v is None:
+            continue
+        if v == "":
+            data.pop(k, None)
+        else:
+            data[k] = v
+    with conn:
+        conn.execute("INSERT OR REPLACE INTO okf_meta (slug, data, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                     (slug, json.dumps(data, sort_keys=True)))
+    return data
+
+def discover_projects() -> dict:
+    """Projects known to Central Brain: registered project maps / .planning dirs plus first-level
+    folders of ~/Projects and ~/Projects-1. Returns {slug: {name, path, map_file, readme}}."""
+    candidates = []
+    for src in load_sources_list():
+        sp = Path(src)
+        if sp.name == "project_map.md" and sp.parent.name == ".agents":
+            candidates.append(sp.parent.parent)
+        elif sp.name == ".planning":
+            candidates.append(sp.parent)
+    for base in (Path.home() / "Projects", Path.home() / "Projects-1"):
+        if base.is_dir():
+            try:
+                candidates.extend(sorted(d for d in base.iterdir() if d.is_dir() and not d.name.startswith(".")))
+            except Exception:
+                pass
+    projects = {}
+    for d in candidates:
+        if d == Path.home() or not d.is_dir():
+            continue
+        slug = slugify(d.name)
+        if slug in projects:
+            continue
+        map_file = d / ".agents" / "project_map.md"
+        planning_state = d / ".planning" / "STATE.md"
+        readme = next((d / n for n in ("README.md", "readme.md") if (d / n).is_file()), None)
+        projects[slug] = {
+            "name": d.name,
+            "path": str(d.resolve()),
+            "map_file": str(map_file) if map_file.is_file() else (str(planning_state) if planning_state.is_file() else None),
+            "readme": str(readme) if readme else None,
+        }
+    return projects
+
+def okf_short_description(text: str, limit: int = 160) -> str:
+    """One-line summary: a leading 'Title:' clause if present, else the first sentence, word-truncated."""
+    t = re.sub(r"\s+", " ", str(text or "")).strip()
+    t = re.sub(r"\s#[A-Za-z][\w-]*", "", t).strip()
+    cand = None
+    m = re.match(r"^([^:]{12,90}):\s", t)
+    if m:
+        head = m.group(1).strip()
+        balanced = head.count("(") == head.count(")") and head.count("'") % 2 == 0 and head.count('"') % 2 == 0
+        if balanced and not re.search(r"https?$", head):
+            cand = head
+    if cand is None:
+        masked = re.sub(r"\b(e\.g|i\.e|etc|vs|approx|incl|No)\.", lambda mm: mm.group(0).replace(".", "\x00"), t)
+        m2 = re.search(r"(?<=[A-Za-z0-9\)\]'\"`])[.;]\s", masked[20:])
+        cand = t[:20 + m2.start() + 1] if m2 else t
+    cand = cand.rstrip(";,: ")
+    if len(cand) > limit:
+        cand = cand[:limit].rsplit(" ", 1)[0].rstrip(",;:") + "…"
+    return cand
+
+def project_doc_description(proj: dict) -> str | None:
+    """First prose paragraph of the project map or README (hard-wrapped lines are joined)."""
+    for key in ("map_file", "readme"):
+        fp = proj.get(key)
+        if not fp:
+            continue
+        try:
+            _, body = parse_frontmatter(Path(fp).read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            continue
+        in_code = False
+        para = []
+        for line in body.splitlines() + [""]:
+            st = line.strip()
+            if st.startswith("```"):
+                in_code = not in_code
+                continue
+            skip = (in_code or not st or st.startswith(("#", "|", "<", "![", "---", "[!"))
+                    or re.match(r"^[-*]?\s*\*\*[^*]{1,40}:\*\*", st) is not None
+                    or re.match(r"^([-*+]|\d+\.)\s", st) is not None)
+            if skip:
+                text = " ".join(para).strip()
+                if len(text) >= 25:
+                    return okf_short_description(text, 180)
+                para = []
+                continue
+            para.append(st.lstrip("> ").strip())
+    return None
+
+def okf_entity_group(entity_slug: str, projects: dict, override: str = None) -> tuple[str, str]:
+    """Places an entity: ('project', proj_slug) when it is/extends a known project, else ('topic', '')."""
+    if override:
+        ov = slugify(override)
+        return ("project", ov) if ov in projects else ("topic", ov)
+    if entity_slug in projects:
+        return "project", entity_slug
+    best, best_score = None, 0
+    etoks = entity_slug.split("-")
+    for ps in projects:
+        ptoks = ps.split("-")
+        if len(ps) >= 6 and entity_slug.startswith(ps + "-"):
+            score = 100 + len(ps)
+        else:
+            common = 0
+            for a, b in zip(etoks, ptoks):
+                if a != b:
+                    break
+                common += 1
+            score = common if (common >= 2 and len(ptoks) >= 2 and len(etoks[0]) >= 3) else 0
+        if score > best_score:
+            best, best_score = ps, score
+    return ("project", best) if best else ("topic", "")
+
+def okf_signature(facts: list, meta: dict, projects: dict) -> str:
+    h = hashlib.sha256()
+    h.update(f"{BRAIN_VERSION}|{OKF_BUILD_REV}".encode())
+    for f in facts:
+        h.update(f"{f['id']}|{f['entity']}|{f['category']}|{f['timestamp']}|{f['fact']}\n".encode("utf-8", "ignore"))
+    h.update(json.dumps(meta, sort_keys=True).encode())
+    for slug in sorted(projects):
+        p = projects[slug]
+        mt = 0
+        for key in ("map_file", "readme"):
+            if p.get(key):
+                try:
+                    mt = max(mt, int(Path(p[key]).stat().st_mtime))
+                except Exception:
+                    pass
+        h.update(f"{slug}|{p['path']}|{p.get('map_file')}|{mt}\n".encode())
+    return h.hexdigest()
+
+def get_brain_meta(conn, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM brain_meta WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else None
+
+def set_brain_meta(conn, key: str, value: str):
+    with conn:
+        conn.execute("INSERT OR REPLACE INTO brain_meta (key, value) VALUES (?, ?)", (key, value))
+
+def upsert_concept(conn, row: dict, fts_body: str):
+    """Inserts/updates a concept row; clears its embedding when the card text changed."""
+    card_hash = hashlib.sha1((row.get("card") or "").encode("utf-8")).hexdigest()
+    prev = conn.execute("SELECT card_hash, embedding FROM concepts WHERE key = ?", (row["key"],)).fetchone()
+    embedding = prev["embedding"] if (prev and prev["card_hash"] == card_hash) else None
+    conn.execute("""
+        INSERT OR REPLACE INTO concepts (key, origin, bundle, concept_id, file_path, type, title, description, tags,
+            status, stale_after, trust, generated_at, resource, links, entities, fact_ids, card, card_hash, embedding, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    """, (row["key"], row["origin"], row["bundle"], row["concept_id"], row.get("file_path"), row.get("type"),
+          row.get("title"), row.get("description"), json.dumps(row.get("tags") or []), row.get("status") or "stable",
+          row.get("stale_after"), row.get("trust") or "unverified", row.get("generated_at"), row.get("resource"),
+          json.dumps(row.get("links") or []), json.dumps(row.get("entities") or []), json.dumps(row.get("fact_ids") or []),
+          row.get("card"), card_hash, embedding))
+    conn.execute("DELETE FROM concepts_fts WHERE key = ?", (row["key"],))
+    conn.execute("INSERT INTO concepts_fts (key, title, description, tags, body) VALUES (?, ?, ?, ?, ?)",
+                 (row["key"], row.get("title") or "", row.get("description") or "", " ".join(row.get("tags") or []), fts_body or ""))
+
+def find_okf_bundle_root(file_path: Path) -> Path:
+    """Nearest ancestor whose index.md declares okf_version; falls back to the file's directory."""
+    curr = file_path.parent
+    for _ in range(8):
+        idx = curr / "index.md"
+        if idx.is_file():
+            try:
+                meta, _ = parse_frontmatter(idx.read_text(encoding="utf-8", errors="ignore")[:2000])
+                if meta and meta.get("okf_version"):
+                    return curr
+            except Exception:
+                pass
+        if curr == curr.parent or curr == Path.home():
+            break
+        curr = curr.parent
+    return file_path.parent
+
+MD_LINK_RE = re.compile(r"\]\(([^)\s]+?\.md)(?:#[^)]*)?\)")
+
+def register_file_concept(conn, file_path: Path, meta: dict, body: str):
+    """Records an authored/external OKF concept (consumer side). Caller manages the transaction."""
+    bundle = find_okf_bundle_root(file_path)
+    try:
+        concept_id = str(file_path.relative_to(bundle).with_suffix(""))
+    except ValueError:
+        concept_id = file_path.stem
+    links = []
+    for target in MD_LINK_RE.findall(body or ""):
+        if re.match(r"^[a-z]+://", target):
+            continue
+        resolved = (bundle / target.lstrip("/")) if target.startswith("/") else (file_path.parent / target)
+        key = f"file:{resolved.resolve()}"
+        if key not in links:
+            links.append(key)
+    gen = meta.get("generated") if isinstance(meta.get("generated"), dict) else {}
+    tags = meta.get("tags") if isinstance(meta.get("tags"), list) else ([meta["tags"]] if meta.get("tags") else [])
+    title = str(meta.get("title") or file_path.stem.replace("-", " ").replace("_", " "))
+    description = str(meta.get("description") or okf_short_description(body, 160))
+    card = f"{title}\n{meta.get('type')}\n{description}\ntags: {', '.join(map(str, tags))}\n\n{(body or '')[:1400]}"
+    upsert_concept(conn, {
+        "key": f"file:{file_path}", "origin": "file", "bundle": str(bundle), "concept_id": concept_id,
+        "file_path": str(file_path), "type": str(meta.get("type")), "title": title, "description": description,
+        "tags": [str(t) for t in tags], "status": str(meta.get("status") or "stable"),
+        "stale_after": to_iso_utc(meta.get("stale_after")), "trust": okf_trust_tier(meta.get("verified")),
+        "generated_at": to_iso_utc(gen.get("at") or meta.get("timestamp")), "resource": meta.get("resource"),
+        "links": links, "card": card,
+    }, fts_body=body or "")
+
+def _fact_date(ts) -> str:
+    iso = to_iso_utc(ts)
+    return iso[:10] if iso else str(ts or "")[:10]
+
+def okf_render_concept(c: dict) -> str:
+    fm = {
+        "type": c["type"],
+        "title": c["title"],
+        "description": c["description"],
+        "resource": c.get("resource"),
+        "tags": c.get("tags"),
+    }
+    if c.get("status") and c["status"] != "stable":
+        fm["status"] = c["status"]
+    fm["stale_after"] = c.get("stale_after")
+    fm["generated"] = {"by": OKF_PRODUCER, "at": c.get("generated_at")} if c.get("generated_at") else {"by": OKF_PRODUCER}
+    verified = c.get("verified") or []
+    if verified:
+        fm["verified"] = verified if len(verified) > 1 else verified[0]
+    fm["sources"] = c.get("sources")
+    fm["entities"] = c.get("entities")
+    fm["fact_ids"] = c.get("fact_ids")
+    lines = [dump_frontmatter(fm)]
+    lines.append(f"# {c['title']}\n")
+    if c.get("summary"):
+        lines.append(c["summary"].strip() + "\n")
+    buckets = {}
+    for f in c.get("facts", []):
+        sec = next((name for cat, name in FACT_SECTIONS if str(f["category"]).lower() == cat.lower()), "Other Notes")
+        buckets.setdefault(sec, []).append(f)
+    for sec in [name for _, name in FACT_SECTIONS] + ["Other Notes"]:
+        if sec not in buckets:
+            continue
+        lines.append(f"## {sec}\n")
+        for f in buckets[sec]:
+            extra = f" [{f['category']}]" if sec == "Other Notes" else ""
+            ent = f" ({f['entity']})" if len(c.get("entities") or []) > 1 else ""
+            lines.append(f"- [#{f['id']}] {_fact_date(f['timestamp'])}{extra}{ent} · {' '.join(str(f['fact']).split())}")
+        lines.append("")
+    if c.get("map_outline"):
+        lines.append("## Project Map\n")
+        lines.append(f"Source: `{c['map_file']}`. Read one section with `brain map show \"{c['project_path']}\" -s \"<Section>\"`.\n")
+        lines.extend(f"- {t}" for t in c["map_outline"])
+        lines.append("")
+    if c.get("children"):
+        lines.append("## Concepts In This Project\n")
+        lines.extend(f"* [{t}](/{cid}.md) - {d}" for t, cid, d in c["children"])
+        lines.append("")
+    if c.get("related"):
+        lines.append("## Related\n")
+        lines.extend(f"* [{t}](/{cid}.md) - {d}" for t, cid, d in c["related"])
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+def okf_build(embed: bool = True, force: bool = False) -> dict:
+    """Compiles facts + project maps into an OKF v0.2 bundle at OKF_DIR and refreshes the concepts table.
+    Skips all work when the facts/meta/project signature is unchanged (cheap to call before every read)."""
+    ensure_dirs()
+    conn = get_db()
+    facts = [dict(r) for r in conn.execute("SELECT id, entity, category, fact, source, timestamp FROM facts ORDER BY id").fetchall()]
+    meta = get_okf_meta(conn)
+    projects = discover_projects()
+    signature = okf_signature(facts, meta, projects)
+    stats = {"path": str(OKF_DIR), "skipped": False, "written": 0, "removed": 0, "embedded": 0}
+
+    if not force and get_brain_meta(conn, "okf_signature") == signature and (OKF_DIR / "index.md").exists():
+        stats["skipped"] = True
+    else:
+        # 1. Group facts into entity concepts (case/punctuation variants of an entity merge by slug).
+        by_slug = {}
+        for f in facts:
+            slug = slugify(f["entity"] or "General")
+            by_slug.setdefault(slug, []).append(f)
+
+        placement = {}
+        for slug in by_slug:
+            kind, group = okf_entity_group(slug, projects, (meta.get(slug) or {}).get("group"))
+            placement[slug] = (kind, group)
+
+        # Topic sub-grouping by leading token when >= 2 topic entities share it.
+        token_counts = {}
+        for slug, (kind, group) in placement.items():
+            if kind == "topic" and not group:
+                tok = slug.split("-")[0]
+                token_counts[tok] = token_counts.get(tok, 0) + 1
+        for slug, (kind, group) in list(placement.items()):
+            if kind == "topic" and not group:
+                tok = slug.split("-")[0]
+                if token_counts.get(tok, 0) >= 2 and len(tok) >= 3 and tok not in GENERIC_GROUP_TOKENS:
+                    placement[slug] = ("topic", tok)
+
+        concepts = {}
+        # 2. Project overview concepts (a project with facts, child concepts, or a map/state file).
+        project_children = {}
+        for slug, (kind, group) in placement.items():
+            if kind == "project":
+                project_children.setdefault(group, []).append(slug)
+        for ps, proj in projects.items():
+            if ps not in project_children and not proj.get("map_file"):
+                continue
+            own = by_slug.get(ps, [])
+            cid = f"projects/{ps}/overview"
+            concepts[cid] = {"concept_id": cid, "slug": ps, "type": "Project", "title": proj["name"], "facts": own,
+                             "entities": sorted({f["entity"] for f in own}), "project": proj}
+
+        for slug, (kind, group) in placement.items():
+            if kind == "project" and slug == group:
+                continue
+            entity_facts = by_slug[slug]
+            if kind == "project":
+                cid = f"projects/{group}/{slug}"
+            elif group:
+                cid = f"topics/{group}/{slug}"
+            else:
+                cid = f"topics/{slug}"
+            names = {}
+            for f in entity_facts:
+                names[f["entity"]] = names.get(f["entity"], 0) + 1
+            title = max(names.items(), key=lambda kv: kv[1])[0]
+            concepts[cid] = {"concept_id": cid, "slug": slug, "type": "Topic", "title": title,
+                             "facts": entity_facts, "entities": sorted(names), "parent_project": group if kind == "project" else None}
+
+        # 3. Metadata, descriptions, sources, trust.
+        for cid, c in concepts.items():
+            m = meta.get(c["slug"]) or {}
+            c["facts"] = sorted(c["facts"], key=lambda f: (to_iso_utc(f["timestamp"]) or "", f["id"]), reverse=True)
+            c["fact_ids"] = [f["id"] for f in c["facts"]]
+            latest = to_iso_utc(c["facts"][0]["timestamp"]) if c["facts"] else None
+            proj = c.get("project")
+            if proj and not latest:
+                for key in ("map_file", "readme"):
+                    if proj.get(key):
+                        try:
+                            latest = to_iso_utc(datetime.fromtimestamp(Path(proj[key]).stat().st_mtime, tz=timezone.utc))
+                        except Exception:
+                            pass
+                        break
+            c["generated_at"] = latest
+            if m.get("type"):
+                c["type"] = m["type"]
+            desc = m.get("description")
+            if not desc and proj:
+                desc = project_doc_description(proj)
+            if not desc and c["facts"]:
+                desc = okf_short_description(c["facts"][0]["fact"])
+            c["description"] = desc or f"{c['title']} ({c['type']})"
+            tag_counts = {}
+            for f in c["facts"]:
+                for t in re.findall(r"(?<![\w&])#([A-Za-z][\w-]{1,30})", str(f["fact"])):
+                    tag_counts[t.lower()] = tag_counts.get(t.lower(), 0) + 1
+            tags = [t for t, _ in sorted(tag_counts.items(), key=lambda kv: (-kv[1], kv[0]))][:8]
+            if not tags:
+                tags = sorted({str(f["category"]).lower() for f in c["facts"]})
+            c["tags"] = tags
+            c["status"] = m.get("status") or "stable"
+            c["stale_after"] = m.get("stale_after")
+            c["verified"] = m.get("verified") or []
+            c["trust"] = okf_trust_tier(c["verified"])
+            sources = []
+            if c["facts"]:
+                ents = ", ".join(json.dumps(e, ensure_ascii=False) for e in c["entities"])
+                sources.append({"id": "facts", "resource": f"central-brain facts where entity in [{ents}]",
+                                "title": f"Central Brain facts store ({len(c['facts'])} facts)", "last_modified": latest})
+            if proj:
+                c["resource"] = Path(proj["path"]).as_uri()
+                c["project_path"] = proj["path"]
+                for key, sid, stitle in (("map_file", "project-map", "Project map"), ("readme", "readme", "Project README")):
+                    if proj.get(key):
+                        try:
+                            lm = to_iso_utc(datetime.fromtimestamp(Path(proj[key]).stat().st_mtime, tz=timezone.utc))
+                        except Exception:
+                            lm = None
+                        sources.append({"id": sid, "resource": proj[key], "title": stitle, "last_modified": lm})
+                if proj.get("map_file"):
+                    try:
+                        _, outline = extract_markdown_section(Path(proj["map_file"]).read_text(encoding="utf-8", errors="ignore"), "__none__")
+                        c["map_outline"] = outline[:40]
+                        c["map_file"] = proj["map_file"]
+                    except Exception:
+                        pass
+            c["sources"] = sources
+
+        # 4. Graph edges: parent/child and mentions of other concepts' titles in fact text.
+        by_slug_cid = {c["slug"]: cid for cid, c in concepts.items()}
+        name_index = []
+        for cid, c in concepts.items():
+            for name in {c["title"], *c["entities"]}:
+                if len(name) >= 5 and name.lower() not in ("general", "system"):
+                    name_index.append((re.compile(r"(?<![\w/.~-])" + re.escape(name.lower()) + r"(?![\w/-])"), cid))
+        for cid, c in concepts.items():
+            text = " ".join(str(f["fact"]).lower() for f in c["facts"])
+            counts = {}
+            for rx, other in name_index:
+                if other != cid:
+                    n = len(rx.findall(text))
+                    if n:
+                        counts[other] = counts.get(other, 0) + n
+            parent = c.get("parent_project")
+            if parent and f"projects/{parent}/overview" in concepts:
+                counts[f"projects/{parent}/overview"] = counts.get(f"projects/{parent}/overview", 0) + 1000
+            ranked = sorted(counts.items(), key=lambda kv: -kv[1])[:8]
+            c["related"] = [(concepts[o]["title"], o, concepts[o]["description"]) for o, _ in ranked]
+            if c["type"] == "Project" or c["concept_id"].endswith("/overview"):
+                kids = [k for k in concepts if k.startswith(c["concept_id"].rsplit("/", 1)[0] + "/") and k != cid]
+                c["children"] = [(concepts[k]["title"], k, concepts[k]["description"]) for k in sorted(kids)]
+                c["related"] = [r for r in c["related"] if r[1] not in kids]
+            if c.get("project"):
+                c["summary"] = f"{c['description']}\n\nProject root: `{c['project_path']}`"
+
+        # 5. Render files: concepts, per-directory index.md, root index.md, log.md.
+        files = {}
+        for cid, c in concepts.items():
+            files[f"{cid}.md"] = okf_render_concept(c)
+
+        dirs = {}
+        for cid in concepts:
+            parts = cid.split("/")
+            for depth in range(1, len(parts)):
+                dirs.setdefault("/".join(parts[:depth]), set())
+            dirs.setdefault("/".join(parts[:-1]), set()).add(cid)
+
+        def dir_stats(d):
+            ids = [k for k in concepts if k.startswith(d + "/")]
+            return len(ids), sum(len(concepts[k]["facts"]) for k in ids)
+
+        def dir_title(d):
+            leaf = d.split("/")[-1]
+            if d.startswith("projects/") and leaf in projects:
+                return projects[leaf]["name"]
+            if d.count("/"):
+                for k in sorted(concepts):
+                    if k.startswith(d + "/"):
+                        word = re.split(r"[\s_\-]+", concepts[k]["title"])[0]
+                        if slugify(word) == leaf:
+                            return word
+                return leaf.replace("-", " ").title()
+            return leaf.title()
+
+        for d in sorted(dirs):
+            depth_children = sorted({k.split("/")[d.count("/") + 1] for k in concepts if k.startswith(d + "/") and k.count("/") > d.count("/") + 1})
+            out = [f"# {dir_title(d)}\n"]
+            if depth_children:
+                out.append("## Groups\n" if d == "topics" else "## Directories\n")
+                entries = []
+                for sub in depth_children:
+                    sd = f"{d}/{sub}"
+                    n_c, n_f = dir_stats(sd)
+                    ov = concepts.get(f"{sd}/overview")
+                    desc = ov["description"] if ov else ", ".join(sorted(concepts[k]["title"] for k in concepts if k.startswith(sd + "/"))[:4])
+                    latest = max((concepts[k]["generated_at"] or "" for k in concepts if k.startswith(sd + "/")), default="")
+                    entries.append((latest, f"* [{dir_title(sd)}]({sub}/) - {desc} ({n_c} concepts, {n_f} facts)"))
+                out.extend(e for _, e in sorted(entries, key=lambda x: x[0], reverse=True))
+                out.append("")
+            direct = sorted(dirs[d], key=lambda k: (concepts[k]["type"] != "Project", -(len(concepts[k]["facts"])), concepts[k]["title"].lower()))
+            if direct:
+                out.append("## Concepts\n")
+                for k in direct:
+                    c = concepts[k]
+                    flag = f" [{c['status']}]" if c["status"] != "stable" else ""
+                    out.append(f"* [{c['title']}]({k.split('/')[-1]}.md) - {c['description']}{flag} ({len(c['facts'])} facts)")
+                out.append("")
+            files[f"{d}/index.md"] = "\n".join(out).rstrip() + "\n"
+
+        latest_all = max((c["generated_at"] or "" for c in concepts.values()), default="")
+        n_proj = len({k.split("/")[1] for k in concepts if k.startswith("projects/")})
+        n_topic = sum(1 for k in concepts if k.startswith("topics/"))
+        root = [dump_frontmatter({"okf_version": OKF_VERSION}),
+                "# Central Brain Knowledge Bundle\n",
+                f"OKF v{OKF_VERSION} bundle compiled by {OKF_PRODUCER} from {len(facts)} verified facts into {len(concepts)} concepts "
+                f"(latest change {latest_all[:10] or 'n/a'}). Concepts carry `[#id]` fact references for `brain correct --id` / `brain forget --id`.\n",
+                "## Sections\n",
+                f"* [Projects](projects/) - {n_proj} projects with their maps, decisions and fixes",
+                f"* [Topics](topics/) - {n_topic} system, hardware and domain topics",
+                "* [Update Log](log.md) - chronological history of fact changes\n",
+                "## Recently Updated\n"]
+        for k in sorted(concepts, key=lambda k: concepts[k]["generated_at"] or "", reverse=True)[:10]:
+            c = concepts[k]
+            root.append(f"* [{c['title']}]({k}.md) - {c['description']}")
+        files["index.md"] = "\n".join(root).rstrip() + "\n"
+
+        cid_by_entity_slug = {c["slug"]: cid for cid, c in concepts.items()}
+        for cid, c in concepts.items():
+            for e in c["entities"]:
+                cid_by_entity_slug.setdefault(slugify(e), cid)
+        log_lines = ["# Central Brain Update Log\n"]
+        cutoff = datetime.now(timezone.utc).timestamp() - 90 * 86400
+        by_day = {}
+        for f in sorted(facts, key=lambda f: (to_iso_utc(f["timestamp"]) or "", f["id"]), reverse=True):
+            dt = parse_iso(f["timestamp"])
+            if not dt or dt.timestamp() < cutoff:
+                continue
+            by_day.setdefault(dt.strftime("%Y-%m-%d"), []).append(f)
+        for day in sorted(by_day, reverse=True):
+            log_lines.append(f"## {day}")
+            for f in by_day[day]:
+                cid = cid_by_entity_slug.get(slugify(f["entity"] or "General"))
+                ref = f"[{concepts[cid]['title']}](/{cid}.md)" if cid else f["entity"]
+                log_lines.append(f"* **{f['category']}**: {ref} [#{f['id']}] {okf_short_description(f['fact'], 110)}")
+            log_lines.append("")
+        files["log.md"] = "\n".join(log_lines).rstrip() + "\n"
+
+        # 6. Write changed files; remove files we generated earlier that no longer exist.
+        OKF_DIR.mkdir(parents=True, exist_ok=True)
+        for rel, content in files.items():
+            fp = OKF_DIR / rel
+            try:
+                if fp.exists() and fp.read_text(encoding="utf-8") == content:
+                    continue
+            except Exception:
+                pass
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            tmp = fp.with_suffix(f".tmp.{os.getpid()}")
+            tmp.write_text(content, encoding="utf-8")
+            os.replace(tmp, fp)
+            stats["written"] += 1
+        for fp in sorted(OKF_DIR.rglob("*.md"), reverse=True):
+            rel = str(fp.relative_to(OKF_DIR))
+            if rel in files:
+                continue
+            try:
+                head = fp.read_text(encoding="utf-8", errors="ignore")[:1500]
+            except Exception:
+                continue
+            m, _ = parse_frontmatter(head + "\n")
+            generated_by = str(((m or {}).get("generated") or {}).get("by", "")) if isinstance((m or {}).get("generated"), dict) else ""
+            if fp.name in ("index.md", "log.md") or generated_by.startswith("central-brain/"):
+                fp.unlink()
+                stats["removed"] += 1
+        for d in sorted((p for p in OKF_DIR.rglob("*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
+            try:
+                d.rmdir()
+            except OSError:
+                pass
+
+        # 7. Concepts table (origin='facts').
+        with conn:
+            keep = set()
+            for cid, c in concepts.items():
+                key = f"okf:{cid}"
+                keep.add(key)
+                fact_text = "\n".join(f"[{f['category']}] {f['fact']}" for f in c["facts"])
+                card = (f"{c['title']}\n{c['type']}\n{c['description']}\nentities: {', '.join(c['entities'])}\n"
+                        f"tags: {', '.join(c['tags'])}\n\n{fact_text}")[:1800]
+                links = [f"okf:{o}" for _, o, _ in c.get("related", [])] + [f"okf:{o}" for _, o, _ in c.get("children", [])]
+                upsert_concept(conn, {
+                    "key": key, "origin": "facts", "bundle": str(OKF_DIR), "concept_id": cid,
+                    "file_path": str(OKF_DIR / f"{cid}.md"), "type": c["type"], "title": c["title"],
+                    "description": c["description"], "tags": c["tags"], "status": c["status"],
+                    "stale_after": c["stale_after"], "trust": c["trust"], "generated_at": c["generated_at"],
+                    "resource": c.get("resource"), "links": links, "entities": c["entities"],
+                    "fact_ids": c["fact_ids"], "card": card,
+                }, fts_body=fact_text + "\n" + "\n".join(c.get("map_outline") or []))
+            for (old_key,) in conn.execute("SELECT key FROM concepts WHERE origin = 'facts'").fetchall():
+                if old_key not in keep:
+                    conn.execute("DELETE FROM concepts WHERE key = ?", (old_key,))
+                    conn.execute("DELETE FROM concepts_fts WHERE key = ?", (old_key,))
+        set_brain_meta(conn, "okf_signature", signature)
+        set_brain_meta(conn, "okf_built_at", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+
+    if embed:
+        stats["embedded"] = ensure_concept_embeddings(conn)
+    row = conn.execute("SELECT COUNT(*), SUM(origin = 'facts'), SUM(origin = 'file') FROM concepts").fetchone()
+    stats.update({"concepts": row[0] or 0, "generated_concepts": row[1] or 0, "file_concepts": row[2] or 0})
+    return stats
+
+def okf_refresh_quiet():
+    """Keeps the on-disk bundle current after fact mutations; never fails the calling command."""
+    try:
+        okf_build(embed=False)
+    except Exception as e:
+        print(f"[Brain Warning] OKF bundle refresh failed: {e}", file=sys.stderr)
+
+def ensure_concept_embeddings(conn=None) -> int:
+    conn = conn or get_db()
+    rows = conn.execute("SELECT key, card FROM concepts WHERE embedding IS NULL AND card IS NOT NULL").fetchall()
+    done = 0
+    for i in range(0, len(rows), EMBED_BATCH_SIZE):
+        batch = rows[i:i + EMBED_BATCH_SIZE]
+        vecs = get_embeddings_batch([r["card"] for r in batch])
+        if not any(vecs):
+            break
+        with conn:
+            for r, v in zip(batch, vecs):
+                if v:
+                    conn.execute("UPDATE concepts SET embedding = ? WHERE key = ?", (encode_vector_blob(v), r["key"]))
+                    done += 1
+    return done
+
+def okf_resolve(conn, target: str) -> tuple[list[dict], list[str]]:
+    """Resolves a concept by key, concept ID, slug, title, entity name, or a directory/group prefix.
+    Returns (matching concept rows, suggestions)."""
+    rows = [dict(r) for r in conn.execute("SELECT * FROM concepts").fetchall()]
+    t = str(target or "").strip().strip("/")
+    if t.endswith(".md"):
+        t = t[:-3]
+    tl = t.lower()
+    ts = slugify(t)
+    for pred in (
+        lambda r: r["key"].lower() == tl or r["concept_id"].lower() == tl,
+        lambda r: r["concept_id"].lower().split("/")[-1] == tl or r["concept_id"].lower().split("/")[-1] == ts,
+        lambda r: (r["title"] or "").lower() == tl or slugify(r["title"] or "") == ts,
+        lambda r: any(slugify(e) == ts for e in json.loads(r["entities"] or "[]")),
+        lambda r: r["concept_id"] == f"projects/{ts}/overview",
+    ):
+        hits = [r for r in rows if pred(r)]
+        if hits:
+            return hits, []
+    group = [r for r in rows if r["concept_id"].lower().startswith(tl + "/") or r["concept_id"].lower().startswith(f"topics/{ts}/")
+             or r["concept_id"].lower().startswith(f"projects/{ts}/")]
+    if group:
+        return group, []
+    titles = {r["title"]: r for r in rows if r["title"]}
+    sugg = difflib.get_close_matches(t, list(titles), n=5, cutoff=0.5)
+    sugg += [r["title"] for r in rows if tl and tl in (r["title"] or "").lower() and r["title"] not in sugg][:5]
+    return [], sugg[:6]
+
+def okf_concept_flags(row: dict, now: datetime = None) -> list[str]:
+    flags = []
+    if row.get("status") and row["status"] != "stable":
+        flags.append(row["status"])
+    if okf_is_stale(row.get("stale_after"), now):
+        flags.append(f"stale since {str(row['stale_after'])[:10]}")
+    return flags
+
+def _age_label(iso: str | None) -> str:
+    dt = parse_iso(iso)
+    if not dt:
+        return "age n/a"
+    days = int((datetime.now(timezone.utc) - dt).total_seconds() // 86400)
+    return "today" if days <= 0 else f"{days}d ago"
+
+def quick_map(query: str = None, target_dir: Path = None, top_n: int = 5, max_items: int = 3, show_all: bool = False) -> dict:
+    """RAG + OKF quick map. With a query: ranks concepts by card similarity, concept BM25, and fact/chunk
+    evidence from hybrid search, then attaches the best evidence and 1-hop neighbours per concept.
+    Without a query: project view when inside a known project, else the bundle overview."""
+    build = okf_build(embed=True)
+    conn = get_db()
+    rows = [dict(r) for r in conn.execute("SELECT * FROM concepts").fetchall()]
+    by_key = {r["key"]: r for r in rows}
+    now = datetime.now(timezone.utc)
+    result = {"query": query, "bundle": str(OKF_DIR), "okf_version": OKF_VERSION, "concept_count": len(rows),
+              "concepts": [], "other_facts": [], "documents": []}
+
+    def concept_brief(r):
+        return {"key": r["key"], "concept_id": r["concept_id"], "title": r["title"], "type": r["type"],
+                "description": r["description"], "trust": r["trust"], "status": r["status"],
+                "flags": okf_concept_flags(r, now), "updated": r["generated_at"], "age": _age_label(r["generated_at"]),
+                "origin": r["origin"], "file": r["file_path"],
+                "fact_count": len(json.loads(r["fact_ids"] or "[]"))}
+
+    if not query:
+        target = Path(target_dir or Path.cwd()).resolve()
+        proj_row = None
+        if not show_all:
+            best_len = 0
+            for r in rows:
+                res = r.get("resource") or ""
+                if r["origin"] == "facts" and res.startswith("file://"):
+                    ppath = res[len("file://"):]
+                    ppath = unquote(ppath)
+                    if (str(target) == ppath or str(target).startswith(ppath + "/")) and len(ppath) > best_len:
+                        proj_row, best_len = r, len(ppath)
+        if proj_row:
+            result["mode"] = "project"
+            result["project"] = concept_brief(proj_row)
+            prefix = proj_row["concept_id"].rsplit("/", 1)[0] + "/"
+            kids = [r for r in rows if r["concept_id"].startswith(prefix) and r["key"] != proj_row["key"]]
+            result["concepts"] = [concept_brief(r) for r in sorted(kids, key=lambda r: r["generated_at"] or "", reverse=True)]
+            links = json.loads(proj_row["links"] or "[]")
+            result["related"] = [concept_brief(by_key[k]) for k in links if k in by_key and not by_key[k]["concept_id"].startswith(prefix)][:6]
+            fact_ids = json.loads(proj_row["fact_ids"] or "[]")[:max_items + 2]
+            result["recent_facts"] = [dict(r) for r in conn.execute(
+                f"SELECT id, entity, category, fact, timestamp FROM facts WHERE id IN ({','.join('?' * len(fact_ids))}) ORDER BY timestamp DESC",
+                fact_ids).fetchall()] if fact_ids else []
+            try:
+                txt = Path(proj_row["file_path"]).read_text(encoding="utf-8", errors="ignore")
+                sec, _ = extract_markdown_section(txt, "Project Map")
+                result["map_outline"] = [l[2:] for l in (sec or "").splitlines() if l.startswith("- ")]
+                result["map_file"] = next((s for s in re.findall(r"Source: `([^`]+)`", sec or "")), None)
+            except Exception:
+                result["map_outline"] = []
+            return result
+        result["mode"] = "overview"
+        groups = {}
+        for r in rows:
+            parts = r["concept_id"].split("/")
+            if r["origin"] == "file":
+                g = ("external", Path(r["bundle"]).name)
+            elif parts[0] == "projects":
+                g = ("projects", parts[1])
+            else:
+                g = ("topics", parts[1] if len(parts) > 2 else "")
+            e = groups.setdefault(g, {"concepts": 0, "facts": 0, "latest": "", "titles": []})
+            e["concepts"] += 1
+            e["facts"] += len(json.loads(r["fact_ids"] or "[]"))
+            e["latest"] = max(e["latest"], r["generated_at"] or "")
+            if r["concept_id"].endswith("/overview"):
+                e["titles"].insert(0, r["title"])
+            else:
+                e["titles"].append(r["title"])
+        result["groups"] = [{"section": k[0], "group": k[1], **v} for k, v in sorted(groups.items(), key=lambda kv: kv[1]["latest"], reverse=True)]
+        result["recent"] = [concept_brief(r) for r in sorted(rows, key=lambda r: r["generated_at"] or "", reverse=True)[:8]]
+        result["flagged"] = [concept_brief(r) for r in rows if okf_concept_flags(r, now)]
+        return result
+
+    result["mode"] = "query"
+    qvec = get_embedding(query)
+    res = search_brain(query, top_k=12, query_vec=qvec)
+
+    card_sim = {}
+    if qvec:
+        emb_rows = [r for r in rows if r["embedding"]]
+        for r, sim in zip(emb_rows, batch_cosine(qvec, [r["embedding"] for r in emb_rows])):
+            card_sim[r["key"]] = sim
+    fts_score = {}
+    fq = build_fts_query(query)
+    if fq:
+        try:
+            for i, r in enumerate(conn.execute("SELECT key FROM concepts_fts WHERE concepts_fts MATCH ? ORDER BY bm25(concepts_fts) LIMIT 30", (fq,)).fetchall()):
+                fts_score[r[0]] = 1.0 / (i + 1)
+        except sqlite3.Error:
+            pass
+
+    entity_key = {}
+    for r in rows:
+        if r["origin"] == "facts":
+            for e in json.loads(r["entities"] or "[]"):
+                entity_key[slugify(e)] = r["key"]
+    file_key = {r["file_path"]: r["key"] for r in rows if r["origin"] == "file"}
+    project_prefixes = []
+    for r in rows:
+        if r["origin"] == "facts" and (r.get("resource") or "").startswith("file://"):
+            project_prefixes.append((unquote(r["resource"][len("file://"):]) + "/", r["key"]))
+    project_prefixes.sort(key=lambda x: -len(x[0]))
+
+    def chunk_concept(fp):
+        if fp in file_key:
+            return file_key[fp]
+        for pre, key in project_prefixes:
+            if fp.startswith(pre):
+                return key
+        return None
+
+    fact_ev, chunk_ev, fact_hits, chunk_hits = {}, {}, {}, {}
+    for f in res["facts"]:
+        key = entity_key.get(slugify(f["entity"] or "General"))
+        if key:
+            fact_ev[key] = max(fact_ev.get(key, 0.0), f.get("score", 0.0))
+            fact_hits.setdefault(key, []).append(f)
+    episodes_prefix = str(EPISODES_DIR.resolve()) + "/"
+    for c in res["chunks"]:
+        if c.get("score", 0.0) < QM_DOC_FLOOR:
+            continue
+        key = chunk_concept(c["file_path"])
+        if key:
+            chunk_ev[key] = max(chunk_ev.get(key, 0.0), min(1.0, c.get("score", 0.0)))
+            chunk_hits.setdefault(key, []).append(c)
+
+    scored = []
+    for key in set(card_sim) | set(fts_score) | set(fact_ev) | set(chunk_ev):
+        r = by_key.get(key)
+        if not r:
+            continue
+        evidence = max(fact_ev.get(key, 0.0), 0.8 * chunk_ev.get(key, 0.0))
+        score = QM_W_CARD * card_sim.get(key, 0.0) + QM_W_FTS * fts_score.get(key, 0.0) + QM_W_EVIDENCE * evidence
+        if not qvec:
+            score = 0.6 * fts_score.get(key, 0.0) + 0.4 * evidence
+        mult = 1.0
+        if r["status"] == "deprecated":
+            mult *= 0.6
+        elif r["status"] == "draft":
+            mult *= 0.9
+        if okf_is_stale(r["stale_after"], now):
+            mult *= 0.85
+        if r["trust"] == "human-reviewed":
+            mult *= 1.1
+        scored.append((score * mult, key))
+    scored.sort(reverse=True)
+    if not scored:
+        return result
+    best = scored[0][0]
+    chosen = [k for sc, k in scored if sc >= best * 0.72 and sc >= QM_MIN_SCORE][:top_n]
+    chosen_set = set(chosen)
+
+    for key in chosen:
+        r = by_key[key]
+        item = concept_brief(r)
+        item["score"] = round(next(sc for sc, k in scored if k == key), 4)
+        evidence = []
+        if r["origin"] == "facts":
+            ids = json.loads(r["fact_ids"] or "[]")
+            if ids:
+                frows = conn.execute(
+                    f"SELECT f.id, f.entity, f.category, f.fact, f.timestamp, v.embedding FROM facts f "
+                    f"LEFT JOIN fact_vectors v ON v.fact_id = f.id WHERE f.id IN ({','.join('?' * len(ids))})", ids).fetchall()
+                if qvec:
+                    sims = batch_cosine(qvec, [fr["embedding"] or b"" for fr in frows])
+                    hit_ids = {f["id"] for f in fact_hits.get(key, [])}
+                    ranked = sorted(zip(sims, frows), key=lambda x: (x[1]["id"] in hit_ids, x[0]), reverse=True)
+                else:
+                    ranked = [(0.0, fr) for fr in sorted(frows, key=lambda fr: fr["timestamp"] or "", reverse=True)]
+                for sim, fr in ranked[:max_items]:
+                    evidence.append({"kind": "fact", "id": fr["id"], "category": fr["category"], "entity": fr["entity"],
+                                     "text": fr["fact"], "date": _fact_date(fr["timestamp"])})
+        for c in chunk_hits.get(key, [])[:max(0, max_items - len(evidence)) or 1]:
+            evidence.append({"kind": "chunk", "file": c["file_path"], "header": c.get("header"), "text": c.get("content", "")})
+        item["evidence"] = evidence[:max_items + 1]
+        item["related"] = [{"title": by_key[k]["title"], "concept_id": by_key[k]["concept_id"]}
+                           for k in json.loads(r["links"] or "[]") if k in by_key and k not in chosen_set][:4]
+        result["concepts"].append(item)
+
+    for f in res["facts"]:
+        if f.get("score", 0.0) < QUICKMAP_OTHER_FACT_FLOOR:
+            continue
+        if entity_key.get(slugify(f["entity"] or "General")) not in chosen_set:
+            result["other_facts"].append({"id": f["id"], "category": f["category"], "entity": f["entity"], "text": f["fact"]})
+    for c in res["chunks"]:
+        if c.get("score", 0.0) < QM_DOC_FLOOR:
+            continue
+        if c["file_path"].startswith(episodes_prefix) or re.search(r"/episodes/\d{4}-\d{2}-\d{2}\.md$", c["file_path"]):
+            continue  # episode logs duplicate facts, which are already surfaced with their [#id]
+        if chunk_concept(c["file_path"]) in chosen_set:
+            continue
+        result["documents"].append({"file": c["file_path"], "header": c.get("header"), "text": c.get("content", ""), "score": c.get("score")})
+    result["other_facts"] = result["other_facts"][:3]
+    result["documents"] = result["documents"][:3]
+    return result
+
+def _clip(text: str, n: int) -> str:
+    t = " ".join(str(text or "").split())
+    return t if len(t) <= n else t[:n].rsplit(" ", 1)[0] + "…"
+
+def render_quick_map(qm: dict, snippet_chars: int = 220) -> str:
+    home = str(Path.home())
+    short = lambda p: str(p).replace(home, "~", 1) if p else p
+    out = []
+    mode = qm.get("mode")
+    if mode == "query":
+        out.append(f"🗺️  QUICK MAP: \"{qm['query']}\"  (OKF v{qm['okf_version']} · {qm['concept_count']} concepts · {short(qm['bundle'])})")
+        if not qm["concepts"]:
+            raw = " Raw retrieval hits are listed below." if (qm.get("other_facts") or qm.get("documents")) else " Try other keywords or `brain query`."
+            out.append("  No concept clears the relevance floor." + raw)
+        for i, c in enumerate(qm["concepts"], 1):
+            flags = "".join(f" ⚠ {f}" for f in c["flags"])
+            out.append(f"\n{i}. {c['title']}  [{c['type']} · {c['concept_id']} · {c['fact_count']} facts · {c['trust']} · {c['age']}]{flags}")
+            out.append(f"   {_clip(c['description'], 200)}")
+            for e in c.get("evidence", []):
+                if e["kind"] == "fact":
+                    ent = f" ({e['entity']})" if e["entity"] != c["title"] else ""
+                    out.append(f"   • [#{e['id']}] [{e['category']}]{ent} {e['date']}: {_clip(e['text'], snippet_chars)}")
+                else:
+                    out.append(f"   • 📄 {Path(e['file']).name} > {e.get('header')}: {_clip(e['text'], snippet_chars - 40)}")
+            if c.get("related"):
+                out.append("   ↳ related: " + ", ".join(r["title"] for r in c["related"]))
+        if qm.get("other_facts"):
+            out.append("\n📌 Other matching facts:")
+            for f in qm["other_facts"]:
+                out.append(f"   • [#{f['id']}] [{f['category']}] ({f['entity']}): {_clip(f['text'], snippet_chars - 40)}")
+        if qm.get("documents"):
+            out.append("\n📄 Other documents:")
+            for d in qm["documents"]:
+                out.append(f"   • {short(d['file'])} > {d.get('header')}: {_clip(d['text'], snippet_chars - 60)}")
+        out.append("\n💡 Drill down: brain okf show <concept_id>  ·  fix a fact: brain correct --id <N> \"...\"  ·  retire a concept: brain okf set <concept> --status deprecated")
+    elif mode == "project":
+        p = qm["project"]
+        flags = "".join(f" ⚠ {f}" for f in p["flags"])
+        out.append(f"🗺️  QUICK MAP · PROJECT {p['title']}  [{p['concept_id']} · {p['fact_count']} facts · {p['age']}]{flags}")
+        out.append(f"   {_clip(p['description'], 220)}")
+        if qm.get("map_outline"):
+            out.append(f"\n🧭 Project map sections ({short(qm.get('map_file'))}):")
+            out.append("   " + " · ".join(qm["map_outline"][:24]))
+        if qm.get("recent_facts"):
+            out.append("\n📌 Recent facts:")
+            for f in qm["recent_facts"]:
+                out.append(f"   • [#{f['id']}] [{f['category']}] {_fact_date(f['timestamp'])}: {_clip(f['fact'], snippet_chars)}")
+        if qm.get("concepts"):
+            out.append(f"\n📦 Concepts in this project ({len(qm['concepts'])}):")
+            for c in qm["concepts"][:12]:
+                flags = "".join(f" ⚠ {f}" for f in c["flags"])
+                out.append(f"   • {c['title']} ({c['fact_count']} facts, {c['age']}){flags}: {_clip(c['description'], 120)}")
+        if qm.get("related"):
+            out.append("\n↳ Related topics: " + ", ".join(r["title"] for r in qm["related"]))
+        out.append(f"\n💡 Search inside it: brain quickmap \"<question>\"  ·  full concept: brain okf show {p['concept_id']}")
+    else:
+        out.append(f"🗺️  QUICK MAP · OVERVIEW  (OKF v{qm['okf_version']} · {qm['concept_count']} concepts · {short(qm['bundle'])}/index.md)")
+        for section, label in (("projects", "📁 Projects"), ("topics", "🧩 Topics"), ("external", "📚 External OKF bundles")):
+            gs = [g for g in qm.get("groups", []) if g["section"] == section]
+            if not gs:
+                continue
+            out.append(f"\n{label} ({len(gs)}):")
+            for g in gs[:14]:
+                name = g["titles"][0] if (section == "projects" and g["titles"]) else (g["group"] or "(ungrouped)")
+                extra = "" if section == "projects" else f" — {', '.join(g['titles'][:3])}{'…' if len(g['titles']) > 3 else ''}"
+                out.append(f"   • {name}: {g['concepts']} concepts, {g['facts']} facts, updated {_age_label(g['latest'])}{extra}")
+            if len(gs) > 14:
+                out.append(f"   … {len(gs) - 14} more (see {short(qm['bundle'])}/{section}/index.md)")
+        if qm.get("recent"):
+            out.append("\n🕒 Recently updated:")
+            for c in qm["recent"]:
+                out.append(f"   • {c['title']} [{c['concept_id']}] {c['age']}: {_clip(c['description'], 110)}")
+        if qm.get("flagged"):
+            out.append(f"\n⚠ Flagged concepts ({len(qm['flagged'])}): " + ", ".join(f"{c['title']} ({'/'.join(c['flags'])})" for c in qm["flagged"][:10]))
+        out.append("\n💡 brain quickmap \"<question>\" for a ranked map · brain okf show <concept_id|group> to open one")
+    return "\n".join(out) + "\n"
+
+def okf_validate(bundle_dir: Path) -> dict:
+    """OKF v0.2 §11 conformance check. Errors break conformance; warnings are soft guidance."""
+    bundle_dir = Path(bundle_dir).resolve()
+    errors, warnings = [], []
+    concepts = 0
+    if not bundle_dir.is_dir():
+        return {"bundle": str(bundle_dir), "conformant": False, "errors": [f"Not a directory: {bundle_dir}"], "warnings": [], "concepts": 0}
+    ids = {str(p.relative_to(bundle_dir).with_suffix("")) for p in bundle_dir.rglob("*.md")}
+    for fp in sorted(bundle_dir.rglob("*.md")):
+        rel = str(fp.relative_to(bundle_dir))
+        try:
+            text = fp.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            errors.append(f"{rel}: not valid UTF-8")
+            continue
+        meta, body = parse_frontmatter(text)
+        if fp.name == "index.md":
+            if meta and (fp.parent != bundle_dir or set(meta) - {"okf_version"}):
+                errors.append(f"{rel}: index.md may only carry frontmatter at bundle root, and only okf_version (§8)")
+            continue
+        if fp.name == "log.md":
+            for h in re.findall(r"^##\s+(.+)$", body, flags=re.M):
+                if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", h.strip()):
+                    errors.append(f"{rel}: log date heading '{h.strip()}' is not ISO YYYY-MM-DD (§9)")
+            continue
+        concepts += 1
+        if meta is None:
+            errors.append(f"{rel}: missing or unparseable YAML frontmatter (§4.1)")
+            continue
+        if not str(meta.get("type") or "").strip():
+            errors.append(f"{rel}: frontmatter has no non-empty 'type' (§4.1)")
+        if meta.get("status") and meta["status"] not in ("draft", "stable", "deprecated"):
+            warnings.append(f"{rel}: unknown status '{meta['status']}' (§5.4)")
+        for key in ("stale_after",):
+            if meta.get(key) and not re.search(r"(Z|[+-]\d{2}:?\d{2})$", str(meta[key])):
+                warnings.append(f"{rel}: {key} lacks an explicit UTC offset (§5)")
+        gen = meta.get("generated")
+        if gen is not None and (not isinstance(gen, dict) or not gen.get("by")):
+            warnings.append(f"{rel}: generated.by is required within generated (§5.2)")
+        for src in meta.get("sources") or []:
+            if not isinstance(src, dict) or not src.get("resource"):
+                warnings.append(f"{rel}: every sources entry needs a resource (§5.1)")
+        for target in MD_LINK_RE.findall(body):
+            if re.match(r"^[a-z]+://", target):
+                continue
+            resolved = (bundle_dir / target.lstrip("/")) if target.startswith("/") else (fp.parent / target)
+            if not resolved.exists():
+                warnings.append(f"{rel}: broken link {target} (allowed, §6.1)")
+    root_idx = bundle_dir / "index.md"
+    if not root_idx.exists():
+        warnings.append("index.md: no bundle-root index (allowed, consumers synthesize one)")
+    return {"bundle": str(bundle_dir), "conformant": not errors, "concepts": concepts,
+            "errors": errors, "warnings": warnings[:50], "warning_count": len(warnings)}
 
 def init_project(project_name: str, target_dir: Path = None, description: str = "") -> tuple[bool, str]:
     """Scaffolds a clean .planning/ spec-driven structure and registers it with Central Brain."""
@@ -1657,7 +3177,20 @@ def generate_role_context(role: str = "general", target_dir: Path = None, max_to
             ORDER BY id DESC LIMIT 5
         """).fetchall()
 
-    lines.append(f"## 3. Verified Rules & Fixes ({role_norm})")
+    lines.append("## 3. Knowledge Map (OKF)")
+    n_concepts = conn.execute("SELECT COUNT(*) FROM concepts").fetchone()[0]
+    lines.append(f"- **Bundle:** `{OKF_DIR}/index.md` ({n_concepts} concepts). Orient first with `brain quickmap \"<task>\"`; open one with `brain okf show <concept_id>`.")
+    proj_path = st.get("project_path") if "error" not in st else None
+    if proj_path:
+        prow = conn.execute("SELECT concept_id, fact_ids, links FROM concepts WHERE origin = 'facts' AND resource = ?",
+                            (Path(proj_path).resolve().as_uri(),)).fetchone()
+        if prow:
+            rel = [conn.execute("SELECT title FROM concepts WHERE key = ?", (k,)).fetchone() for k in json.loads(prow["links"] or "[]")[:6]]
+            rel_titles = ", ".join(r[0] for r in rel if r)
+            lines.append(f"- **Project concept:** `{prow['concept_id']}` ({len(json.loads(prow['fact_ids'] or '[]'))} facts)" + (f"; related: {rel_titles}" if rel_titles else ""))
+    lines.append("")
+
+    lines.append(f"## 4. Verified Rules & Fixes ({role_norm})")
     if facts:
         for f in facts:
             lines.append(f"- [#{f['id']}] **[{f['category']}]** ({f['entity']}): {f['fact']}")
@@ -1666,7 +3199,7 @@ def generate_role_context(role: str = "general", target_dir: Path = None, max_to
     lines.append("")
 
     lines.extend([
-        "## 4. Execution Directives",
+        "## 5. Execution Directives",
         "- **Spec-Driven Loop:** DISCUSS -> PLAN -> EXECUTE -> VERIFY -> SHIP & REMEMBER.",
         "- **Quality Gates:** Empirically verify all code and commands before completing tasks.",
         "- **Memory Persistence:** When resolving issues, persist verified findings via:",
@@ -1702,6 +3235,10 @@ def clean_orphans(dry_run: bool = False):
                 conn.execute("DELETE FROM chunks_fts WHERE file_path = ?", (fp_str,))
                 orphan_files += 1
                 orphan_chunks += count
+        for key, fp_str in conn.execute("SELECT key, file_path FROM concepts WHERE origin = 'file'").fetchall():
+            if not fp_str or not Path(fp_str).exists():
+                conn.execute("DELETE FROM concepts WHERE key = ?", (key,))
+                conn.execute("DELETE FROM concepts_fts WHERE key = ?", (key,))
 
     return orphan_files, orphan_chunks
 
@@ -1980,6 +3517,9 @@ def remove_source(path: Path | str, purge_chunks: bool = True) -> tuple[bool, st
         conn = get_db()
         with conn:
             purged_count = conn.execute("DELETE FROM chunks WHERE file_path = ? OR file_path LIKE ?", (matched, f"{matched}/%")).rowcount
+            for (ckey,) in conn.execute("SELECT key FROM concepts WHERE origin = 'file' AND (file_path = ? OR file_path LIKE ?)", (matched, f"{matched}/%")).fetchall():
+                conn.execute("DELETE FROM concepts WHERE key = ?", (ckey,))
+                conn.execute("DELETE FROM concepts_fts WHERE key = ?", (ckey,))
             if purged_count > 0:
                 conn.execute("DELETE FROM chunks_fts WHERE file_path = ? OR file_path LIKE ?", (matched, f"{matched}/%"))
 
@@ -2050,14 +3590,20 @@ def sync_brain():
     orphan_files, orphan_chunks = clean_orphans()
     sync_facts_json()
     backfilled_count = backfill_missing_embeddings()
+    backfilled_count += ensure_fact_vectors()
+    try:
+        okf_stats = okf_build(embed=True)
+    except Exception as e:
+        okf_stats = {"error": str(e)}
 
-    return synced_paths, total_chunks, orphan_files, orphan_chunks, backfilled_count
+    return synced_paths, total_chunks, orphan_files, orphan_chunks, backfilled_count, okf_stats
 
 def get_status():
     conn = get_db()
     total_chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
     total_files = conn.execute("SELECT COUNT(DISTINCT file_path) FROM chunks").fetchone()[0]
     total_facts = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+    total_concepts = conn.execute("SELECT COUNT(*) FROM concepts").fetchone()[0]
 
     ollama_ok = False
     try:
@@ -2073,13 +3619,15 @@ def get_status():
         "total_indexed_files": total_files,
         "total_chunks": total_chunks,
         "total_facts": total_facts,
+        "okf_concepts": total_concepts,
+        "okf_bundle": str(OKF_DIR),
         "ollama_embedding_status": f"Connected ({DEFAULT_EMBED_MODEL} via /api/embed)" if ollama_ok else "Unavailable / Fallback to FTS",
         "database_size_bytes": db_size,
         "database_size_mb": round(db_size / (1024 * 1024), 2)
     }
 
 def run_doctor(fix: bool = False) -> tuple[bool, dict]:
-    """Runs a 7-point health check across SQLite, Ollama, vector completeness, registries, and backups.
+    """Runs a 8-point health check across SQLite, Ollama, vector completeness, registries, and backups.
     If fix is True, automatically repairs recoverable defects.
     Returns (all_passed, results_dict).
     """
@@ -2092,7 +3640,8 @@ def run_doctor(fix: bool = False) -> tuple[bool, dict]:
         "vector_completeness": {"passed": False, "detail": ""},
         "sources_health": {"passed": False, "detail": ""},
         "fts5_index": {"passed": False, "detail": ""},
-        "backup_freshness": {"passed": False, "detail": ""}
+        "backup_freshness": {"passed": False, "detail": ""},
+        "okf_bundle": {"passed": False, "detail": ""}
     }
     fixes_applied = []
 
@@ -2260,6 +3809,34 @@ def run_doctor(fix: bool = False) -> tuple[bool, dict]:
                 fixes_applied.append("Created initial backup archive.")
                 results["backup_freshness"]["passed"] = True
 
+    # 8. OKF Knowledge Bundle (current, conformant, concept vectors complete)
+    try:
+        facts_now = [dict(r) for r in conn.execute("SELECT id, entity, category, fact, source, timestamp FROM facts ORDER BY id").fetchall()]
+        current = get_brain_meta(conn, "okf_signature") == okf_signature(facts_now, get_okf_meta(conn), discover_projects())
+        val = okf_validate(OKF_DIR) if (OKF_DIR / "index.md").exists() else {"conformant": False, "errors": ["bundle not built"], "concepts": 0}
+        missing_vec = conn.execute("SELECT COUNT(*) FROM concepts WHERE embedding IS NULL").fetchone()[0]
+        n_concepts = conn.execute("SELECT COUNT(*) FROM concepts").fetchone()[0]
+        problems = []
+        if not current:
+            problems.append("out of date with facts")
+        if not val["conformant"]:
+            problems.append(f"{len(val['errors'])} OKF conformance error(s)")
+        if missing_vec:
+            problems.append(f"{missing_vec} concept(s) missing embeddings")
+        if not problems:
+            results["okf_bundle"]["passed"] = True
+            results["okf_bundle"]["detail"] = f"OKF v{OKF_VERSION} bundle current & conformant ({n_concepts} concepts)"
+        else:
+            results["okf_bundle"]["detail"] = "; ".join(problems)
+            if fix:
+                st = okf_build(embed=True, force=True)
+                val = okf_validate(OKF_DIR)
+                left = conn.execute("SELECT COUNT(*) FROM concepts WHERE embedding IS NULL").fetchone()[0]
+                fixes_applied.append(f"Rebuilt OKF bundle ({st.get('concepts')} concepts, {st.get('written')} files written, {st.get('embedded')} embedded).")
+                results["okf_bundle"]["passed"] = val["conformant"] and left == 0
+    except Exception as e:
+        results["okf_bundle"]["detail"] = f"OKF check exception: {e}"
+
     all_passed = all(v["passed"] for v in results.values())
     results["_meta"] = {
         "all_passed": all_passed,
@@ -2400,7 +3977,7 @@ def run_mcp_server():
                     "result": {
                         "protocolVersion": "2024-11-05",
                         "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "central-brain", "version": "2.2.0"}
+                        "serverInfo": {"name": "central-brain", "version": BRAIN_VERSION}
                     }
                 }
             elif method == "tools/list":
@@ -2422,6 +3999,29 @@ def run_mcp_server():
                                         "compact": {"type": "boolean", "default": False, "description": "Token-efficient compact output format"}
                                     },
                                     "required": ["query"]
+                                }
+                            },
+                            {
+                                "name": "brain_quickmap",
+                                "description": "Quick map (RAG + OKF): rank knowledge concepts (projects/topics) for a question and return the best [#id] facts, document hits, trust/lifecycle flags, and related concepts. Omit query for a project/overview map.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "query": {"type": "string", "description": "Question or keywords (optional)"},
+                                        "top": {"type": "integer", "default": 5},
+                                        "path": {"type": "string", "description": "Optional project path for the no-query view"},
+                                        "format": {"type": "string", "enum": ["text", "json"], "default": "text"}
+                                    }
+                                }
+                            },
+                            {
+                                "name": "brain_okf_show",
+                                "description": "Open an OKF concept (by id, title, entity) or a group index from the Central Brain knowledge bundle.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "target": {"type": "string", "description": "Concept id/title/entity or group (omit for root index)"}
+                                    }
                                 }
                             },
                             {
@@ -2541,7 +4141,7 @@ def run_mcp_server():
                             },
                             {
                                 "name": "brain_doctor",
-                                "description": "Run 7-point health check across SQLite, Ollama, vector completeness, registries, and backups, with optional auto-repair.",
+                                "description": "Run 8-point health check across SQLite, Ollama, vector completeness, registries, and backups, with optional auto-repair.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -2577,6 +4177,26 @@ def run_mcp_server():
                         compact_chunks = [{"file": Path(c["file_path"]).name, "header": c.get("header"), "snippet": c.get("content", "")[:120].strip()} for c in res.get("chunks", [])]
                         res = {"facts": compact_facts, "chunks": compact_chunks}
                     resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": json.dumps(res, indent=2)}]}}
+                elif name == "brain_quickmap":
+                    qm = quick_map(args.get("query") or None, target_dir=args.get("path"), top_n=int(args.get("top", 5)))
+                    text = json.dumps(qm, indent=2, default=str) if args.get("format") == "json" else render_quick_map(qm)
+                    resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": text}]}}
+                elif name == "brain_okf_show":
+                    okf_build(embed=False)
+                    tgt = (args.get("target") or "").strip().strip("/")
+                    if not tgt:
+                        text = (OKF_DIR / "index.md").read_text(encoding="utf-8")
+                    elif (OKF_DIR / tgt / "index.md").is_file():
+                        text = (OKF_DIR / tgt / "index.md").read_text(encoding="utf-8")
+                    else:
+                        hits, sugg = okf_resolve(get_db(), tgt)
+                        if len(hits) == 1 and Path(hits[0]["file_path"]).exists():
+                            text = Path(hits[0]["file_path"]).read_text(encoding="utf-8", errors="ignore")
+                        elif hits:
+                            text = "Multiple matches: " + ", ".join(h["concept_id"] for h in hits)
+                        else:
+                            text = f"No concept matches '{tgt}'. Suggestions: {', '.join(sugg) or 'none'}"
+                    resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": text}]}}
                 elif name == "brain_remember":
                     remember(args.get("fact"), args.get("entity", "General"), args.get("category", "Knowledge"), source="MCP")
                     resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": "Fact saved to Central Brain successfully."}]}}
@@ -2771,6 +4391,36 @@ def main():
          -d, --description DESC     Brief project summary description
          --json                     Output in structured JSON format
 
+     brain quickmap [question...] [options] (aliases: qmap, qm)
+       Quick map = RAG + OKF. Ranks OKF concepts (projects/topics) for a question using
+       concept-card vectors, concept BM25, and fact/chunk evidence, then shows the best
+       [#id] facts, document hits, and 1-hop related concepts per concept.
+       With no question: project view inside a known project, else bundle overview.
+       Options:
+         -n, --top INT              Concepts to show (default: 5)
+         -i, --items INT            Evidence items per concept (default: 3)
+         -p, --path PATH            Project directory for the no-question view
+         -a, --all                  Force the bundle overview (ignore current project)
+         --max-tokens INT           Limit output to approximate token budget
+         --json                     Output in structured JSON format
+
+     brain okf [subcommand] [args...]
+       Open Knowledge Format (OKF v0.2) bundle compiled from facts + project maps at
+       ~/.central_brain/okf (index.md, log.md, projects/, topics/). Authored OKF concepts
+       (markdown with `type:` frontmatter) in any registered source are indexed too.
+       Subcommands:
+         build [--force] [--no-embed]  Rebuild the bundle (auto-runs on remember/sync/quickmap)
+         show [target]              Print a concept file, or a group/dir index (default: root index)
+         validate [dir]             OKF §11 conformance check (default: the generated bundle)
+         set <target> [opts]        Concept lifecycle/placement overrides (target: concept id,
+                                    title, entity, or group like topics/realtek):
+                                      --status draft|stable|deprecated   --stale-after YYYY-MM-DD
+                                      --description TEXT  --group NAME  --type TYPE
+                                      (pass an empty string to clear a field)
+         verify <target> [--by ACTOR]  Record a verification (actor: human:<id>, agent/<ver>,
+                                    process:<id>; defaults to human:$USER only on a TTY)
+         path                       Print the bundle path
+
   3. SOURCES & INDEXING
      brain sources [subcommand] [args...]
        Manage registered Central Brain knowledge sources and directories.
@@ -2811,7 +4461,7 @@ def main():
          --json                     Output in structured JSON format
 
      brain doctor [options] (alias: repair)
-       Run 7-point health check and self-heal Central Brain systems.
+       Run 8-point health check and self-heal Central Brain systems.
        Options:
          --fix                      Automatically repair detected issues (backfill vectors,
                                     prune dead sources, rebuild FTS5, fresh backup)
@@ -2940,6 +4590,45 @@ def main():
     map_init_cmd.add_argument("path", nargs="?", default=None, help="Target project directory (default: current dir)")
     map_init_cmd.add_argument("--json", action="store_true", help="Output in JSON format")
 
+    # quickmap
+    qm_p = sub.add_parser("quickmap", aliases=["qmap", "qm"], help="Quick map (RAG + OKF): ranked concepts, evidence facts, and related topics")
+    qm_p.add_argument("text", nargs="*", help="Question or keywords (omit for project view / overview)")
+    qm_p.add_argument("-n", "--top", type=int, default=5, help="Number of concepts to show (default: 5)")
+    qm_p.add_argument("-i", "--items", type=int, default=3, help="Evidence items per concept (default: 3)")
+    qm_p.add_argument("-p", "--path", type=str, default=None, help="Project directory for the no-question view")
+    qm_p.add_argument("-a", "--all", action="store_true", help="Show the bundle overview even inside a project")
+    qm_p.add_argument("--max-tokens", type=int, default=None, help="Limit output to approximate token budget")
+    qm_p.add_argument("--json", action="store_true", help="Output in JSON format")
+
+    # okf
+    okf_p = sub.add_parser("okf", help="Manage the Open Knowledge Format (OKF v0.2) knowledge bundle")
+    okf_sub = okf_p.add_subparsers(dest="okf_action")
+    okf_b = okf_sub.add_parser("build", help="Rebuild the OKF bundle from facts and project maps")
+    okf_b.add_argument("--force", action="store_true", help="Rebuild even if nothing changed")
+    okf_b.add_argument("--no-embed", action="store_true", help="Skip concept embeddings")
+    okf_b.add_argument("--json", action="store_true", help="Output in JSON format")
+    okf_s = okf_sub.add_parser("show", help="Print a concept file or a group index")
+    okf_s.add_argument("target", nargs="?", default=None, help="Concept id, title, entity, or group (default: root index)")
+    okf_s.add_argument("--max-tokens", type=int, default=None, help="Limit output to approximate token budget")
+    okf_s.add_argument("--json", action="store_true", help="Output in JSON format")
+    okf_v = okf_sub.add_parser("validate", help="Check OKF v0.2 conformance of a bundle directory")
+    okf_v.add_argument("dir", nargs="?", default=None, help="Bundle directory (default: generated bundle)")
+    okf_v.add_argument("--json", action="store_true", help="Output in JSON format")
+    okf_set = okf_sub.add_parser("set", help="Set lifecycle/placement overrides for a concept or group")
+    okf_set.add_argument("target", type=str, help="Concept id, title, entity, or group (e.g. topics/realtek)")
+    okf_set.add_argument("--status", choices=["draft", "stable", "deprecated", ""], default=None, help="Lifecycle status")
+    okf_set.add_argument("--stale-after", type=str, default=None, help="Date/datetime after which content is stale ('' clears)")
+    okf_set.add_argument("--description", type=str, default=None, help="Override the one-line description ('' clears)")
+    okf_set.add_argument("--group", type=str, default=None, help="Place under a project slug or topic group ('' clears)")
+    okf_set.add_argument("--type", type=str, default=None, help="Override the concept type ('' clears)")
+    okf_set.add_argument("--json", action="store_true", help="Output in JSON format")
+    okf_ver = okf_sub.add_parser("verify", help="Record a verification event on a concept or group")
+    okf_ver.add_argument("target", type=str, help="Concept id, title, entity, or group")
+    okf_ver.add_argument("--by", type=str, default=None, help="Actor: human:<id>, <agent>/<version>, or process:<id>")
+    okf_ver.add_argument("--json", action="store_true", help="Output in JSON format")
+    okf_path = okf_sub.add_parser("path", help="Print the OKF bundle path")
+    okf_path.add_argument("--json", action="store_true", help="Output in JSON format")
+
     # sources
     src_p = sub.add_parser("sources", help="Manage registered Central Brain knowledge sources and directories")
     src_sub = src_p.add_subparsers(dest="sources_action")
@@ -2964,7 +4653,7 @@ def main():
     info_p.add_argument("--json", action="store_true", help="Output in JSON format")
 
     # doctor / repair
-    doc_p = sub.add_parser("doctor", aliases=["repair"], help="Run 7-point health check and self-heal Central Brain systems")
+    doc_p = sub.add_parser("doctor", aliases=["repair"], help="Run 8-point health check and self-heal Central Brain systems")
     doc_p.add_argument("--fix", action="store_true", help="Automatically repair detected issues (backfill embeddings, sync facts, prune dead sources, rebuild FTS5)")
     doc_p.add_argument("--json", action="store_true", help="Output diagnostic results in JSON format")
 
@@ -3351,6 +5040,122 @@ def main():
                         full_out = f"{header}\n\n{body}\n"
                     print(apply_token_budget(full_out, max_tokens))
 
+    elif args.command in ["quickmap", "qmap", "qm"]:
+        question = " ".join(args.text).strip() or None
+        qm = quick_map(question, target_dir=args.path, top_n=max(1, args.top), max_items=max(1, args.items), show_all=args.all)
+        if is_json:
+            print(apply_token_budget(json.dumps({"status": "success", "command": "quickmap", "data": qm}, indent=2, default=str), args.max_tokens))
+        else:
+            print(apply_token_budget(render_quick_map(qm), args.max_tokens))
+
+    elif args.command == "okf":
+        action = getattr(args, "okf_action", None) or "show"
+        if action == "build":
+            st = okf_build(embed=not args.no_embed, force=args.force)
+            if is_json:
+                print(json.dumps({"status": "success", "command": "okf", "action": "build", "data": st}, indent=2))
+            else:
+                print(f"🗺️  OKF bundle {'unchanged' if st['skipped'] else 'built'}: {st['concepts']} concepts "
+                      f"({st['generated_concepts']} generated, {st['file_concepts']} from sources) at {st['path']} — "
+                      f"{st['written']} files written, {st['removed']} removed, {st['embedded']} embedded.")
+        elif action == "path":
+            print(json.dumps({"status": "success", "command": "okf", "data": {"path": str(OKF_DIR)}}) if is_json else str(OKF_DIR))
+        elif action == "validate":
+            if not args.dir:
+                okf_build(embed=False)
+            val = okf_validate(Path(args.dir) if args.dir else OKF_DIR)
+            if is_json:
+                print(json.dumps({"status": "success" if val["conformant"] else "error", "command": "okf", "action": "validate", "data": val}, indent=2))
+            else:
+                print(f"{'✅' if val['conformant'] else '❌'} {val['bundle']}: {'conformant with' if val['conformant'] else 'NOT conformant with'} OKF v{OKF_VERSION} "
+                      f"({val['concepts']} concepts, {len(val['errors'])} errors, {val.get('warning_count', 0)} warnings)")
+                for e in val["errors"][:30]:
+                    print(f"  ✗ {e}")
+                for w in val["warnings"][:15]:
+                    print(f"  • {w}")
+        elif action == "show":
+            okf_build(embed=False)
+            conn = get_db()
+            text, info = None, {}
+            if not args.target:
+                fp = OKF_DIR / "index.md"
+                text, info = fp.read_text(encoding="utf-8"), {"file": str(fp)}
+            else:
+                t = args.target.strip().strip("/")
+                dir_idx = OKF_DIR / t / "index.md"
+                if dir_idx.is_file():
+                    text, info = dir_idx.read_text(encoding="utf-8"), {"file": str(dir_idx)}
+                else:
+                    hits, sugg = okf_resolve(conn, t)
+                    if len(hits) == 1:
+                        fp = Path(hits[0]["file_path"])
+                        text = fp.read_text(encoding="utf-8", errors="ignore") if fp.exists() else None
+                        info = {"file": str(fp), "concept_id": hits[0]["concept_id"], "trust": hits[0]["trust"], "status": hits[0]["status"]}
+                    elif hits:
+                        text = "Multiple concepts match; pick one:\n" + "\n".join(f"  • {h['concept_id']} — {h['title']}" for h in hits)
+                        info = {"matches": [h["concept_id"] for h in hits]}
+                    else:
+                        info = {"error": f"No concept matches '{args.target}'.", "suggestions": sugg}
+            if is_json:
+                print(apply_token_budget(json.dumps({"status": "success" if text else "error", "command": "okf", "action": "show", "data": {**info, "content": text}}, indent=2), args.max_tokens))
+            elif text:
+                print(apply_token_budget(text, args.max_tokens))
+            else:
+                print(f"❌ {info['error']}" + (f"\n💡 Did you mean: {', '.join(info['suggestions'])}" if info.get("suggestions") else ""))
+        elif action in ("set", "verify"):
+            conn = get_db()
+            okf_build(embed=False)
+            hits, sugg = okf_resolve(conn, args.target)
+            hits = [h for h in hits if h["origin"] == "facts"]
+            if not hits:
+                msg = f"No generated concept matches '{args.target}'." + (f" Did you mean: {', '.join(sugg)}?" if sugg else "") + \
+                      " (Authored OKF files are edited directly in their frontmatter.)"
+                print(json.dumps({"status": "error", "command": "okf", "action": action, "error": msg}) if is_json else f"❌ {msg}")
+                return
+            if action == "set":
+                updates = {"status": args.status, "description": args.description, "group": args.group, "type": args.type}
+                if args.stale_after is not None:
+                    if args.stale_after == "":
+                        updates["stale_after"] = ""
+                    else:
+                        iso = to_iso_utc(args.stale_after if "T" in args.stale_after or " " in args.stale_after else args.stale_after + "T00:00:00+00:00")
+                        if not iso:
+                            print(f"❌ Invalid --stale-after value: {args.stale_after}")
+                            return
+                        updates["stale_after"] = iso
+                if all(v is None for v in updates.values()):
+                    print("❌ Nothing to set. Use --status, --stale-after, --description, --group, or --type.")
+                    return
+            else:
+                actor = args.by
+                if not actor:
+                    if sys.stdin.isatty():
+                        actor = f"human:{os.getenv('USER') or 'user'}"
+                    else:
+                        print("❌ Non-interactive verify needs --by <actor> (human:<id> only for a real human review).")
+                        return
+            changed = []
+            for h in hits:
+                # Meta is keyed by entity slug (stable across regrouping); a project overview keys by project slug.
+                if h["concept_id"].endswith("/overview"):
+                    slugs = {h["concept_id"].split("/")[-2]}
+                else:
+                    slugs = {slugify(e) for e in json.loads(h["entities"] or "[]")} or {h["concept_id"].split("/")[-1]}
+                for sl in slugs:
+                    if action == "set":
+                        set_okf_meta(conn, sl, updates)
+                    else:
+                        cur = get_okf_meta(conn).get(sl, {})
+                        ver = [v for v in cur.get("verified", []) if v.get("by") != actor]
+                        ver.append({"by": actor, "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
+                        set_okf_meta(conn, sl, {"verified": ver})
+                changed.append(h["concept_id"])
+            st = okf_build(embed=True)
+            if is_json:
+                print(json.dumps({"status": "success", "command": "okf", "action": action, "data": {"concepts": changed, "build": st}}, indent=2))
+            else:
+                print(f"✅ Updated {len(changed)} concept(s): {', '.join(changed[:8])}{'…' if len(changed) > 8 else ''} (bundle rebuilt, {st['written']} files written)")
+
     elif args.command in ["info", "paths"]:
         paths_info = get_paths_info(args.path)
         if is_json:
@@ -3412,7 +5217,7 @@ def main():
         if is_json:
             print(json.dumps({"status": "success" if all_passed else "warning", "command": "doctor", "data": results}, indent=2))
         else:
-            print("\n🩺 CENTRAL BRAIN HEALTH DIAGNOSTICS (7 Quality Gates)")
+            print("\n🩺 CENTRAL BRAIN HEALTH DIAGNOSTICS (8 Quality Gates)")
             print("="*68)
             gate_names = {
                 "sqlite_integrity": "SQLite DB Integrity",
@@ -3421,7 +5226,8 @@ def main():
                 "vector_completeness": "Vector Embeddings",
                 "sources_health": "Sources Registry Health",
                 "fts5_index": "Full-Text Search (FTS5)",
-                "backup_freshness": "Backup Freshness"
+                "backup_freshness": "Backup Freshness",
+                "okf_bundle": "OKF Knowledge Bundle"
             }
             for k, name in gate_names.items():
                 gate = results.get(k, {})
@@ -3620,15 +5426,21 @@ def main():
                 print(f"❌ Error: Path '{args.path}' does not exist.")
 
     elif args.command == "sync":
-        paths, chunks, del_files, del_chunks, backfilled = sync_brain()
+        paths, chunks, del_files, del_chunks, backfilled, okf_stats = sync_brain()
         if is_json:
-            print(json.dumps({"status": "success", "command": "sync", "data": {"synced_paths": paths, "total_chunks": chunks, "purged_files": del_files, "purged_chunks": del_chunks, "backfilled_embeddings": backfilled}}, indent=2))
+            print(json.dumps({"status": "success", "command": "sync", "data": {"synced_paths": paths, "total_chunks": chunks, "purged_files": del_files, "purged_chunks": del_chunks, "backfilled_embeddings": backfilled, "okf": okf_stats}}, indent=2))
         else:
             msg = f"🔄 Central Brain Sync Complete: Processed {paths} sources ({chunks} total chunks active)."
             if del_files > 0:
                 msg += f" Purged {del_files} deleted files ({del_chunks} orphan chunks removed)."
             if backfilled > 0:
                 msg += f" Backfilled {backfilled} missing vector embeddings."
+            if okf_stats.get("error"):
+                msg += f"\n⚠️  OKF bundle build failed: {okf_stats['error']}"
+            else:
+                msg += (f"\n🗺️  OKF bundle: {okf_stats.get('concepts', 0)} concepts ({okf_stats.get('file_concepts', 0)} from sources)"
+                        f" at {okf_stats.get('path')} — {okf_stats.get('written', 0)} files written"
+                        + (" (unchanged)" if okf_stats.get("skipped") else "") + ".")
             print(msg)
 
     elif args.command == "prune":

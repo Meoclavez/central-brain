@@ -15,6 +15,12 @@ The `brain` tool is NOT an LLM tool/function call. Execute it directly via bash/
      `brain query "<keywords_or_problem_description>"`
    - To slash token consumption, use compact mode:
      `brain query "<query>" --compact`
+   - To orient on a task, use the quick map (RAG + OKF). It ranks knowledge concepts and returns their best
+     `[#id]` facts, trust/lifecycle flags, and related concepts:
+     `brain quickmap "<task_or_question>"` (no question: the current project's map, or the bundle overview)
+   - To open a concept or group from the OKF bundle (~/.central_brain/okf): `brain okf show <concept_id|group>`
+   - When a whole topic is obsolete (e.g. replaced hardware), retire it instead of deleting facts:
+     `brain okf set <concept|group> --status deprecated`
    - To inspect project status, milestones, and blockers:
      `brain state [project_path]` (or inspect specific sections: `brain state --section "<Section>"`)
    - To inspect all storage paths and active state file resolution:
