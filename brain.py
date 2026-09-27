@@ -56,10 +56,10 @@ SYSTEM_PROMPT_PATH = BRAIN_DIR / "SYSTEM_PROMPT.md"
 BACKUP_DIR = BRAIN_DIR / "backups"
 OKF_DIR = BRAIN_DIR / "okf"
 
-BRAIN_VERSION = "2.4.0"
+BRAIN_VERSION = "2.4.1"
 OKF_VERSION = "0.2"
 OKF_PRODUCER = f"central-brain/{BRAIN_VERSION}"
-OKF_BUILD_REV = "1"  # bump when bundle rendering changes so existing bundles regenerate
+OKF_BUILD_REV = "2"  # bump when bundle rendering changes so existing bundles regenerate
 
 OLLAMA_EMBED_URL = "http://localhost:11434/api/embed"
 DEFAULT_EMBED_MODEL = "mxbai-embed-large"
@@ -738,7 +738,9 @@ def ingest_file(file_path: Path):
     with conn:
         conn.execute("DELETE FROM chunks WHERE file_path = ?", (str_path,))
         for idx, ((header, chunk_text), vec) in enumerate(zip(chunks, all_vectors)):
-            chunk_hash = f"{file_content_hash}:{idx}:{hashlib.sha256(chunk_text.encode('utf-8')).hexdigest()[:16]}"
+            # Path is part of the key: identical files in two places (copies, shared requirements.txt)
+            # must not collide on the UNIQUE hash column. Prefix stays the file hash for skip checks.
+            chunk_hash = f"{file_content_hash}:{idx}:{hashlib.sha256((str_path + chr(0) + chunk_text).encode('utf-8')).hexdigest()[:16]}"
             vec_blob = encode_vector_blob(vec) if vec else None
             conn.execute(
                 "INSERT INTO chunks (file_path, header, content, embedding, hash, updated_at) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
@@ -753,15 +755,111 @@ def ingest_file(file_path: Path):
 
     return ingested_count
 
+DIR_INGEST_SUFFIXES = ('.md', '.txt', '.conf', '.sh')
+DIR_INGEST_MAX_BYTES = 512 * 1024
+# Dependency, build, cache, and VCS folders never hold project knowledge.
+DIR_INGEST_SKIP_DIRS = {
+    ".git", ".hg", ".svn", "node_modules", ".venv", "venv", "env", "__pycache__", ".mypy_cache",
+    ".pytest_cache", ".ruff_cache", ".tox", "dist", "build", "target", ".gradle", ".dart_tool", ".idea",
+    ".vscode", "site-packages", "vendor", ".next", ".nuxt", ".cache", "coverage", ".terraform", "Pods",
+    "DerivedData", "graphify-out", ".pub-cache", "models", "weights", "checkpoints",
+}
+DIR_INGEST_KEEP_HIDDEN = {".agents", ".planning"}
+
+def _dir_ingest_allowed(path: Path, root: Path) -> bool:
+    try:
+        rel_parts = path.relative_to(root).parts[:-1]
+    except ValueError:
+        return False
+    for part in rel_parts:
+        if part in DIR_INGEST_SKIP_DIRS or (part.startswith(".") and part not in DIR_INGEST_KEEP_HIDDEN):
+            return False
+    if not path.name.endswith(DIR_INGEST_SUFFIXES):
+        return False
+    try:
+        return path.is_file() and path.stat().st_size <= DIR_INGEST_MAX_BYTES
+    except OSError:
+        return False
+
+def iter_source_files(dir_path: Path) -> list[Path]:
+    """Knowledge files under a directory source. A folder with its own .git is enumerated with
+    `git ls-files --exclude-standard` (honours .gitignore); other folders are walked with
+    DIR_INGEST_SKIP_DIRS pruned. .agents/ and .planning/ are always included, even when gitignored."""
+    dir_path = Path(dir_path).resolve()
+    found = set()
+    listed_by_git = False
+    if (dir_path / ".git").exists():
+        try:
+            proc = subprocess.run(["git", "-C", str(dir_path), "ls-files", "-co", "--exclude-standard", "-z"],
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30)
+            if proc.returncode == 0:
+                listed_by_git = True
+                for rel in proc.stdout.decode("utf-8", "ignore").split("\0"):
+                    if rel:
+                        found.add((dir_path / rel).resolve())
+        except Exception:
+            listed_by_git = False
+    if not listed_by_git:
+        for root, dirs, files in os.walk(dir_path):
+            dirs[:] = [d for d in dirs if d not in DIR_INGEST_SKIP_DIRS and (not d.startswith(".") or d in DIR_INGEST_KEEP_HIDDEN)]
+            for f in files:
+                found.add(Path(root) / f)
+    else:
+        for keep in DIR_INGEST_KEEP_HIDDEN:
+            for root, dirs, files in os.walk(dir_path):
+                dirs[:] = [d for d in dirs if d not in DIR_INGEST_SKIP_DIRS and (not d.startswith(".") or d == keep)]
+                if keep in Path(root).relative_to(dir_path).parts:
+                    for f in files:
+                        found.add(Path(root) / f)
+    return sorted(p for p in found if _dir_ingest_allowed(p, dir_path))
+
 def ingest_directory(dir_path: Path):
     total = 0
-    dir_path = dir_path.resolve()
-    for root, _, files in os.walk(dir_path):
-        for file in files:
-            if file.endswith(('.md', '.txt', '.conf', '.sh')):
-                fp = Path(root) / file
-                total += ingest_file(fp)
+    for fp in iter_source_files(dir_path):
+        total += ingest_file(fp)
     return total
+
+def sync_directory_source(dir_path: Path, sources: list[str]) -> tuple[int, int, int]:
+    """Ingests a directory source, then drops chunks under it for files the source no longer covers
+    (gitignored, excluded folder, oversized). Files registered separately, or under another registered
+    directory nested inside this one, are left alone. Returns (chunks, excluded_files, excluded_chunks)."""
+    dir_path = Path(dir_path).resolve()
+    wanted = iter_source_files(dir_path)
+    cnt = sum(ingest_file(fp) for fp in wanted)
+    keep = {str(fp) for fp in wanted}
+    nested = []
+    for s in sources:
+        sp = Path(s).expanduser()
+        if not sp.exists():
+            continue
+        sp = sp.resolve()
+        if sp.is_file():
+            keep.add(str(sp))
+        elif sp != dir_path and str(sp).startswith(str(dir_path) + "/"):
+            nested.append(str(sp))
+    ex_files, ex_chunks = purge_path_chunks(dir_path, keep=keep, keep_prefixes=nested)
+    return cnt, ex_files, ex_chunks
+
+def purge_path_chunks(path: Path | str, keep: set[str] = None, keep_prefixes: list[str] = None) -> tuple[int, int]:
+    """Deletes chunks (and OKF file concepts) for a file or everything under a directory,
+    except paths in `keep` or under `keep_prefixes`. Returns (files_purged, chunks_purged)."""
+    p = str(Path(path).expanduser().resolve())
+    keep = keep or set()
+    prefixes = [x.rstrip("/") + "/" for x in (keep_prefixes or [])]
+    conn = get_db()
+    rows = conn.execute("SELECT file_path, COUNT(*) FROM chunks WHERE file_path = ? OR file_path LIKE ? GROUP BY file_path",
+                        (p, p.rstrip("/") + "/%")).fetchall()
+    files = chunks = 0
+    with conn:
+        for fp, n in rows:
+            if fp in keep or any(fp.startswith(pre) for pre in prefixes):
+                continue
+            conn.execute("DELETE FROM chunks WHERE file_path = ?", (fp,))
+            conn.execute("DELETE FROM concepts WHERE key = ?", (f"file:{fp}",))
+            conn.execute("DELETE FROM concepts_fts WHERE key = ?", (f"file:{fp}",))
+            files += 1
+            chunks += n
+    return files, chunks
 
 def backfill_missing_embeddings(batch_size: int = EMBED_BATCH_SIZE) -> int:
     """Finds chunks in SQLite with NULL embeddings and backfills them via Ollama."""
@@ -1278,12 +1376,21 @@ def discover_projects() -> dict:
     """Projects known to Central Brain: registered project maps / .planning dirs plus first-level
     folders of ~/Projects and ~/Projects-1. Returns {slug: {name, path, map_file, readme}}."""
     candidates = []
+    registered = set()
+    brain_root = BRAIN_DIR.resolve()
     for src in load_sources_list():
         sp = Path(src)
         if sp.name == "project_map.md" and sp.parent.name == ".agents":
             candidates.append(sp.parent.parent)
         elif sp.name == ".planning":
             candidates.append(sp.parent)
+        elif sp.is_dir():
+            spr = sp.resolve()
+            inside_brain = spr == brain_root or str(spr).startswith(str(brain_root) + "/")
+            is_project = any((spr / m).exists() for m in (".git", "README.md", "readme.md", ".agents", "package.json", "pyproject.toml"))
+            if not inside_brain and spr != Path.home() and is_project:
+                candidates.append(spr)
+                registered.add(str(spr))
     for base in (Path.home() / "Projects", Path.home() / "Projects-1"):
         if base.is_dir():
             try:
@@ -1303,6 +1410,7 @@ def discover_projects() -> dict:
         projects[slug] = {
             "name": d.name,
             "path": str(d.resolve()),
+            "registered": str(d.resolve()) in registered,
             "map_file": str(map_file) if map_file.is_file() else (str(planning_state) if planning_state.is_file() else None),
             "readme": str(readme) if readme else None,
         }
@@ -1356,6 +1464,19 @@ def project_doc_description(proj: dict) -> str | None:
                 continue
             para.append(st.lstrip("> ").strip())
     return None
+
+def project_doc_excerpt(proj: dict, limit: int = 1400) -> str:
+    """Leading text of the project map or README, used as the concept card when a project has no facts."""
+    for key in ("map_file", "readme"):
+        fp = proj.get(key)
+        if fp:
+            try:
+                _, body = parse_frontmatter(Path(fp).read_text(encoding="utf-8", errors="ignore"))
+                text = re.sub(r"<[^>]+>|!\[[^\]]*\]\([^)]*\)", "", body)
+                return re.sub(r"\n{3,}", "\n\n", text).strip()[:limit]
+            except Exception:
+                continue
+    return ""
 
 def okf_entity_group(entity_slug: str, projects: dict, override: str = None) -> tuple[str, str]:
     """Places an entity: ('project', proj_slug) when it is/extends a known project, else ('topic', '')."""
@@ -1571,7 +1692,7 @@ def okf_build(embed: bool = True, force: bool = False) -> dict:
             if kind == "project":
                 project_children.setdefault(group, []).append(slug)
         for ps, proj in projects.items():
-            if ps not in project_children and not proj.get("map_file"):
+            if ps not in project_children and not proj.get("map_file") and not proj.get("registered"):
                 continue
             own = by_slug.get(ps, [])
             cid = f"projects/{ps}/overview"
@@ -1814,6 +1935,8 @@ def okf_build(embed: bool = True, force: bool = False) -> dict:
                 key = f"okf:{cid}"
                 keep.add(key)
                 fact_text = "\n".join(f"[{f['category']}] {f['fact']}" for f in c["facts"])
+                if c.get("project") and not c["facts"]:
+                    fact_text = project_doc_excerpt(c["project"])
                 card = (f"{c['title']}\n{c['type']}\n{c['description']}\nentities: {', '.join(c['entities'])}\n"
                         f"tags: {', '.join(c['tags'])}\n\n{fact_text}")[:1800]
                 links = [f"okf:{o}" for _, o, _ in c.get("related", [])] + [f"okf:{o}" for _, o, _ in c.get("children", [])]
@@ -3479,8 +3602,12 @@ def add_source(path: Path | str) -> tuple[bool, str, int]:
     except Exception as e:
         return False, f"Failed to save sources.json: {e}", 0
 
-    chunks = ingest_file(p) if p.is_file() else ingest_directory(p)
-    return True, f"Successfully registered and indexed source ({chunks} chunks): {p_str}", chunks
+    if p.is_file():
+        chunks = ingest_file(p)
+        return True, f"Successfully registered and indexed source ({chunks} chunks): {p_str}", chunks
+    chunks, ex_files, ex_chunks = sync_directory_source(p, sources)
+    dropped = f"; dropped {ex_chunks} chunks from {ex_files} excluded files" if ex_chunks else ""
+    return True, f"Successfully registered and indexed source ({chunks} chunks{dropped}): {p_str}", chunks
 
 def remove_source(path: Path | str, purge_chunks: bool = True) -> tuple[bool, str, int]:
     """Removes a source from sources.json and optionally purges its indexed chunks from DB."""
@@ -3503,6 +3630,10 @@ def remove_source(path: Path | str, purge_chunks: bool = True) -> tuple[bool, st
             break
 
     if not matched:
+        if purge_chunks:
+            files, purged = purge_path_chunks(p)
+            if purged:
+                return True, f"'{p_str}' is not a registered source; purged {purged} ad-hoc chunks from {files} files.", purged
         return False, f"Source not found in registry: {path}", 0
 
     sources.remove(matched)
@@ -3576,6 +3707,7 @@ def sync_brain():
 
     total_chunks = 0
     synced_paths = 0
+    excluded_total = [0, 0]
     for src in sources:
         p = Path(src)
         if p.is_file():
@@ -3583,11 +3715,16 @@ def sync_brain():
             total_chunks += cnt
             synced_paths += 1
         elif p.is_dir():
-            cnt = ingest_directory(p)
+            # Keeps the index equal to the source's file set (e.g. drops a .venv ingested ad hoc earlier).
+            cnt, excluded_files, excluded_chunks = sync_directory_source(p, sources)
             total_chunks += cnt
             synced_paths += 1
+            excluded_total[0] += excluded_files
+            excluded_total[1] += excluded_chunks
 
     orphan_files, orphan_chunks = clean_orphans()
+    orphan_files += excluded_total[0]
+    orphan_chunks += excluded_total[1]
     sync_facts_json()
     backfilled_count = backfill_missing_embeddings()
     backfilled_count += ensure_fact_vectors()
@@ -4427,6 +4564,7 @@ def main():
        Subcommands:
          add <path>                 Register a file or directory in sources.json and index immediately
          remove, rm <path>          Unregister a source and purge its indexed chunks from DB
+                                    (also purges ad-hoc chunks of an unregistered path)
          list, ls                   List all registered sources with status and chunk counts (default)
        Options:
          --keep-chunks              On remove: do not delete chunks from vector database
@@ -4442,6 +4580,8 @@ def main():
 
      brain sync [options]
        Rescan all registered sources, ingest updated files, and backfill embeddings.
+       Directory sources honour .gitignore (own git repos) and skip dependency/build/cache
+       folders and files > 512 KB; chunks for files a source no longer covers are dropped.
        Options:
          --json                     Output in structured JSON format
 
