@@ -120,6 +120,13 @@ brain okf set topics/realtek --status deprecated        # retire obsolete knowle
 brain okf set "MediaTek MT7921 Combo Card" --stale-after 2026-12-31
 brain okf verify "MediaTek MT7921 Combo Card" --by human:meoclavezz
 brain okf validate ~/some/okf-bundle                     # OKF v0.2 §11 conformance check
+brain okf dupes                                          # concepts that look like variants of one entity
+brain okf merge "Realtek BT Fix" --into "Realtek RTL8852BE Bluetooth"   # fold duplicates (fact IDs kept)
+brain okf merge topics/shopify --into "Shopify Horizon Video" --create   # consolidate a sprawled group
+
+# After a kernel / NVIDIA upgrade: facts flagged ⚠ "recorded on kernel 7.1.8→7.2.6"
+brain quickmap --all                # lists system facts recorded on an older kernel series / NVIDIA major
+brain reverify 214 236              # still valid on the running kernel/driver (text unchanged)
 brain sources add ~/some/okf-bundle                      # external/authored OKF concepts join the map
 
 # Remember a new decision, rule, or fix across sessions (smart entity resolution + tags)
@@ -258,7 +265,41 @@ Lifecycle and trust from OKF frontmatter adjust the score: `deprecated` ×0.6, `
 
 **Authored or external OKF bundles.** Any registered source containing markdown with a `type:` frontmatter key is read as OKF: the frontmatter is kept out of the chunk text, titles scope the chunk breadcrumbs, and trust, status, staleness, and markdown links feed the quick map. Write hand-authored concepts in `~/.central_brain/knowledge/`, because `okf/` is generated.
 
-**Schema compatibility.** v2.4 only adds tables (`facts_fts` with triggers, `fact_vectors`, `concepts`, `concepts_fts`, `okf_meta`, `brain_meta`), so older `brain.py` builds keep working on the same database.
+**Entity hygiene.** `brain remember` files a fact under an existing entity when the name is a spelling or suffix variant (`ollama`, `Ollama Fix`, `Ollamma` → `Ollama`), prints similar entities otherwise, and warns when the target concept is deprecated (`--exact-entity` opts out). `brain okf dupes` lists duplicate-looking concepts and groups of one-fact concepts; `brain okf merge` folds them together by renaming the entity — fact IDs, text and timestamps stay the same.
+
+**Kernel / driver drift.** Every fact records the running kernel and NVIDIA driver (`fact_env`); facts written before v2.5 are backfilled from `/var/log/pacman.log` (the version installed at the fact's timestamp). Host-system facts — detected by kernel-level terms such as driver, modprobe, udev, firmware, `.service`, `/etc/…` — recorded on another kernel series (major.minor) or NVIDIA major are flagged with ⚠ in `brain query`, `brain quickmap`, and `brain inject`. `brain reverify <id>…` records that a fact still holds on the running versions; `brain correct --id` does the same while changing the text.
+
+**Output budgets.** `--max-tokens` on `quickmap` condenses gracefully (drops other documents, then other facts, related lists, evidence, lower-ranked concepts) instead of cutting mid-line. `brain inject` keeps its fixed sections whole and fills the rules section with one-line summaries until the budget is reached; facts in deprecated concepts are never injected.
+
+**Schema compatibility.** v2.4+ only adds tables (`facts_fts` with triggers, `fact_vectors`, `concepts`, `concepts_fts`, `okf_meta`, `brain_meta`, `fact_env`), so older `brain.py` builds keep working on the same database.
+
+---
+
+## 🔌 MCP Registration
+
+`brain mcp` is a JSON-RPC 2.0 stdio MCP server (protocol 2024-11-05 … 2025-06-18) exposing `brain_quickmap`, `brain_query`, `brain_remember`, `brain_correct`, `brain_forget`, `brain_reverify`, `brain_okf_show`, `brain_state`, `brain_inject`, and more.
+
+```bash
+# Claude Code (user scope, all projects)
+claude mcp add --scope user central-brain -- ~/.local/bin/brain mcp
+
+# Antigravity / Gemini-style clients: add to the "mcpServers" object of mcp_config.json
+"central-brain": { "command": "/home/<user>/.local/bin/brain", "args": ["mcp"] }
+```
+
+---
+
+## 🧪 Testing
+
+```bash
+# Hermetic unit tests: temporary HOME and brain dir, fake embeddings, no Ollama needed (~0.2 s)
+python3 -m unittest discover -s tests -v
+
+# Retrieval accuracy on a *copy* of your real brain (the live DB is only read via SQLite backup)
+python3 tests/live_eval.py                # cases: ~/.central_brain/eval_cases.json (kept out of the repo)
+```
+
+Never test a development copy by editing `~/.central_brain/brain.py` or running `install.sh`; point `CENTRAL_BRAIN_DIR` at a sandbox copy instead.
 
 ---
 

@@ -56,10 +56,10 @@ SYSTEM_PROMPT_PATH = BRAIN_DIR / "SYSTEM_PROMPT.md"
 BACKUP_DIR = BRAIN_DIR / "backups"
 OKF_DIR = BRAIN_DIR / "okf"
 
-BRAIN_VERSION = "2.4.1"
+BRAIN_VERSION = "2.5.0"
 OKF_VERSION = "0.2"
 OKF_PRODUCER = f"central-brain/{BRAIN_VERSION}"
-OKF_BUILD_REV = "2"  # bump when bundle rendering changes so existing bundles regenerate
+OKF_BUILD_REV = "4"  # bump when bundle rendering changes so existing bundles regenerate
 
 OLLAMA_EMBED_URL = "http://localhost:11434/api/embed"
 DEFAULT_EMBED_MODEL = "mxbai-embed-large"
@@ -233,6 +233,15 @@ def migrate_schema_v24(conn):
         )
     """)
     conn.execute("CREATE TABLE IF NOT EXISTS brain_meta (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS fact_env (
+            fact_id INTEGER PRIMARY KEY,
+            kernel TEXT,
+            nvidia TEXT,
+            source TEXT,
+            recorded_at TEXT
+        )
+    """)
 
 def encode_vector_blob(vec: list[float]) -> bytes:
     """Packs float vector into compact binary IEEE 754 float32 blob."""
@@ -885,6 +894,215 @@ def backfill_missing_embeddings(batch_size: int = EMBED_BATCH_SIZE) -> int:
                     total_backfilled += 1
     return total_backfilled
 
+ENTITY_SUFFIX_WORDS = {"fix", "fixes", "issue", "issues", "bug", "bugs", "config", "configuration", "setup", "notes"}
+
+def entity_key(name: str) -> str:
+    """Slug with trailing generic words removed ('RTL8852BE Bluetooth Fix' ~ 'RTL8852BE Bluetooth')."""
+    toks = slugify(name).split("-")
+    while len(toks) > 1 and toks[-1] in ENTITY_SUFFIX_WORDS:
+        toks.pop()
+    return "-".join(toks)
+
+def resolve_entity(conn, entity: str) -> tuple[str, str, list[str]]:
+    """Maps a requested entity onto an existing one to stop spelling/variant sprawl.
+    Returns (entity_to_use, how, suggestions); how is 'existing', 'normalized', 'snapped', or 'new'.
+    Auto-snaps only on slug equality, suffix-word equality, or a near-typo (ratio >= 0.92)."""
+    rows = conn.execute("SELECT entity, COUNT(*) FROM facts GROUP BY entity").fetchall()
+    counts = {r[0]: r[1] for r in rows if r[0]}
+    if entity in counts:
+        return entity, "existing", []
+    slug, key = slugify(entity), entity_key(entity)
+    same_slug = [e for e in counts if slugify(e) == slug]
+    if same_slug:
+        return max(same_slug, key=lambda e: counts[e]), "normalized", []
+    same_key = [e for e in counts if entity_key(e) == key]
+    if same_key:
+        return max(same_key, key=lambda e: counts[e]), "snapped", []
+    scored = []
+    for e in counts:
+        es = slugify(e)
+        ratio = difflib.SequenceMatcher(None, slug, es).ratio()
+        if ratio >= 0.92:
+            scored.append((2.0 + ratio, e))
+            continue
+        a, b = slug.split("-"), es.split("-")
+        lead = 0
+        for x, y in zip(a, b):
+            if x != y:
+                break
+            lead += 1
+        shared = {t for t in a if len(t) >= 3 and t not in ENTITY_SUFFIX_WORDS} & {t for t in b if len(t) >= 3}
+        if ratio >= 0.72 or lead >= 2 or len(shared) >= 2 or (len(es) >= 5 and (slug.startswith(es + "-") or es.startswith(slug + "-"))):
+            scored.append((ratio + 0.1 * lead + 0.1 * len(shared), e))
+    scored.sort(key=lambda x: (-x[0], -counts[x[1]]))
+    if scored and scored[0][0] >= 2.0:
+        return scored[0][1], "snapped", []
+    return entity, "new", [e for _, e in scored[:3]]
+
+def current_env() -> dict:
+    """Running kernel and NVIDIA driver versions (NVIDIA None when the module is not loaded)."""
+    nvidia = None
+    try:
+        nvidia = Path("/sys/module/nvidia/version").read_text().strip() or None
+    except Exception:
+        try:
+            m = re.search(r"Kernel Module.*?\s(\d+\.\d+(?:\.\d+)?)\s", Path("/proc/driver/nvidia/version").read_text())
+            nvidia = m.group(1) if m else None
+        except Exception:
+            nvidia = None
+    return {"kernel": platform.release(), "nvidia": nvidia}
+
+def record_fact_env(conn, fact_id: int, source: str = "live", env: dict = None):
+    env = env or current_env()
+    conn.execute("INSERT OR REPLACE INTO fact_env (fact_id, kernel, nvidia, source, recorded_at) VALUES (?, ?, ?, ?, ?)",
+                 (fact_id, env.get("kernel"), env.get("nvidia"), source, datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")))
+
+PACMAN_LOG = Path("/var/log/pacman.log")
+
+def pacman_version_timeline(log_path: Path = None) -> dict:
+    """{package: [(utc_datetime, version), ...]} for kernel and NVIDIA packages from pacman.log."""
+    log_path = log_path or PACMAN_LOG
+    pkgs = {"linux", "linux-lts", "linux-zen", "linux-hardened", "nvidia", "nvidia-open", "nvidia-dkms", "nvidia-open-dkms", "nvidia-lts", "nvidia-utils"}
+    out = {}
+    rx = re.compile(r"^\[(\S+)\] \[ALPM\] (installed|upgraded|downgraded|reinstalled) (\S+) \((?:\S+ -> )?(\S+)\)")
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                m = rx.match(line)
+                if not m or m.group(3) not in pkgs:
+                    continue
+                try:
+                    dt = datetime.fromisoformat(m.group(1).replace("Z", "+00:00"))
+                    if dt.tzinfo is None:
+                        dt = dt.astimezone()
+                except Exception:
+                    continue
+                out.setdefault(m.group(3), []).append((dt.astimezone(timezone.utc), m.group(4)))
+    except Exception:
+        return {}
+    return out
+
+def _pkg_to_uname(version: str) -> str:
+    """'7.1.8.arch1-1' -> '7.1.8-arch1-1' (uname -r form); other flavours keep their pkgver."""
+    return re.sub(r"\.(arch|lts|zen|hardened)(\d)", r"-\1\2", version, count=1)
+
+def backfill_fact_env(conn=None) -> int:
+    """Infers kernel/NVIDIA versions for facts recorded before env tagging, from pacman.log upgrade history
+    (the package version installed at the fact's timestamp; source='pacman-log')."""
+    conn = conn or get_db()
+    missing = conn.execute("SELECT f.id, f.timestamp FROM facts f LEFT JOIN fact_env e ON e.fact_id = f.id WHERE e.fact_id IS NULL").fetchall()
+    if not missing:
+        return 0
+    tl = pacman_version_timeline()
+    if not tl:
+        return 0
+    rel = platform.release()
+    kpkg = "linux-lts" if "-lts" in rel else "linux-zen" if "-zen" in rel else "linux-hardened" if "-hardened" in rel else "linux"
+    npkg = next((p for p in ("nvidia-open", "nvidia", "nvidia-open-dkms", "nvidia-dkms", "nvidia-lts", "nvidia-utils") if p in tl), None)
+
+    def at(pkg, when):
+        best = None
+        for dt, ver in tl.get(pkg, []):
+            if dt <= when:
+                best = ver
+            else:
+                break
+        return best
+
+    done = 0
+    with conn:
+        for fid, ts in missing:
+            when = parse_iso(ts)
+            if not when:
+                continue
+            k = at(kpkg, when)
+            if not k:
+                continue
+            n = at(npkg, when) if npkg else None
+            record_fact_env(conn, fid, source="pacman-log",
+                            env={"kernel": _pkg_to_uname(k), "nvidia": re.sub(r"-\d+$", "", n) if n else None})
+            done += 1
+    return done
+
+# Host-system relevance for kernel/driver drift. Strong signals name kernel-level machinery; weak ones are
+# topic words that also appear in unrelated project facts (a portfolio page mentioning "Plasma").
+SYSTEM_STRONG_RE = re.compile(r"\b(kernel|driver|modprobe|module|udev|firmware|dkms|sysfs|acpi|initramfs|mkinitcpio|grub|"
+                              r"pipewire|wireplumber|bluez|btusb|btmtk|mt7921e?|rtw89\w*|rfkill|asusd|mesa|nvidia-open|"
+                              r"xhci|pcie|d3cold|s2idle|\w[\w-]*\.service|/etc/\S+|/sys/\S+|\d+\.\d+\.\d+-arch\d)\b", re.I)
+SYSTEM_WEAK_RE = re.compile(r"\b(nvidia|wayland|x11|xorg|kwin|plasma|kde|sddm|usb|bluetooth|wi-?fi|suspend|hibernat\w*|"
+                            r"resume|systemd|networkmanager|iwd|linux)\b", re.I)
+SYSTEM_FACT_RE = SYSTEM_STRONG_RE  # used for the kernel annotation in bundle files
+
+def is_system_fact(text: str, in_project: bool = False) -> bool:
+    strong = {m.group(0).lower() for m in SYSTEM_STRONG_RE.finditer(text or "")}
+    weak = {m.group(0).lower() for m in SYSTEM_WEAK_RE.finditer(text or "")}
+    if in_project:
+        return len(strong) >= 2
+    return len(strong) >= 1 or len(weak) >= 2
+
+def _series(version: str | None, parts: int) -> str | None:
+    if not version:
+        return None
+    nums = re.findall(r"\d+", version)
+    return ".".join(nums[:parts]) if len(nums) >= parts else None
+
+def env_drift(fact_text: str, env_row, now_env: dict, in_project: bool = False) -> str | None:
+    """Warning when a host-system fact was recorded on another kernel series (major.minor) or NVIDIA major."""
+    if not env_row or not is_system_fact(fact_text, in_project):
+        return None
+    kernel, nvidia = env_row["kernel"], env_row["nvidia"]
+    notes = []
+    if kernel and now_env.get("kernel") and _series(kernel, 2) != _series(now_env["kernel"], 2):
+        notes.append(f"kernel {kernel.split('-')[0]}→{now_env['kernel'].split('-')[0]}")
+    nv_mentioned = re.search(r"nvidia[- ]?(open|driver|module|utils|drm|smi)|nvidia\b.*\b(driver|kernel|egl|gsp|prime|wayland|x11)|\bgsp\b", fact_text or "", re.I)
+    if nv_mentioned and nvidia and now_env.get("nvidia") and _series(nvidia, 1) != _series(now_env["nvidia"], 1):
+        notes.append(f"NVIDIA {nvidia}→{now_env['nvidia']}")
+    return ("recorded on " + ", ".join(notes)) if notes else None
+
+def fact_drift_map(conn, facts: list[dict], now_env: dict = None) -> dict:
+    """{fact_id: warning} for the given fact dicts (needs 'id' and 'fact')."""
+    if not facts:
+        return {}
+    now_env = now_env or current_env()
+    ids = [f["id"] for f in facts]
+    rows = {r["fact_id"]: r for r in conn.execute(
+        f"SELECT fact_id, kernel, nvidia FROM fact_env WHERE fact_id IN ({','.join('?' * len(ids))})", ids).fetchall()}
+    project_ids = set()
+    for r in conn.execute("SELECT fact_ids FROM concepts WHERE origin = 'facts' AND concept_id LIKE 'projects/%'").fetchall():
+        project_ids |= set(json.loads(r[0] or "[]"))
+    out = {}
+    for f in facts:
+        w = env_drift(f.get("fact") or f.get("text") or "", rows.get(f["id"]), now_env, in_project=f["id"] in project_ids)
+        if w:
+            out[f["id"]] = w
+    return out
+
+def reverify_facts(fact_ids: list[int]) -> list[int]:
+    """Marks facts as re-verified on the running kernel/driver without changing their text."""
+    conn = get_db()
+    done = []
+    with conn:
+        for fid in fact_ids:
+            if conn.execute("SELECT 1 FROM facts WHERE id = ?", (fid,)).fetchone():
+                record_fact_env(conn, fid, source="reverified")
+                done.append(fid)
+    if done:
+        env = current_env()
+        append_episode(f"**[Reverified]** Facts {', '.join('#' + str(i) for i in done)} re-verified on kernel {env['kernel']}"
+                       + (f", NVIDIA {env['nvidia']}" if env.get("nvidia") else ""))
+        okf_refresh_quiet()
+    return done
+
+def append_episode(line: str):
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_file = EPISODES_DIR / f"{today_str}.md"
+    mode = "a" if today_file.exists() else "w"
+    with open(today_file, mode, encoding="utf-8") as f:
+        if mode == "w":
+            f.write(f"# Agent Episode Log - {today_str}\n\n")
+        f.write(f"- [{datetime.now().strftime('%H:%M:%S')}] {line}\n")
+    ingest_file(today_file)
+
 def sync_facts_json():
     """Syncs the SQLite facts table into ~/.central_brain/facts.json for version control tracking."""
     conn = get_db()
@@ -903,10 +1121,12 @@ def sync_facts_json():
     with open(FACTS_PATH, "w", encoding="utf-8") as f:
         json.dump(facts_list, f, indent=2)
 
-def remember(fact: str, entity: str = None, category: str = "Knowledge", source: str = "CLI", tags: list[str] = None):
+def remember(fact: str, entity: str = None, category: str = "Knowledge", source: str = "CLI", tags: list[str] = None,
+             exact_entity: bool = False) -> dict:
     """Saves a structured fact to SQLite, syncs facts.json, and appends to today's episode file.
     If entity is None or 'General', auto-resolves to current project name if inside a project directory.
-    """
+    The entity is then mapped onto an existing spelling/variant (see resolve_entity) unless exact_entity.
+    Records the running kernel/NVIDIA versions with the fact. Returns a dict describing what was stored."""
     ensure_dirs()
     cat_map = {"fix": "Fix", "rule": "Rule", "knowledge": "Knowledge", "project": "Project"}
     category = cat_map.get(str(category).lower(), str(category).capitalize() if category else "Knowledge")
@@ -933,11 +1153,17 @@ def remember(fact: str, entity: str = None, category: str = "Knowledge", source:
             fact = f"{fact} {' '.join(tag_tokens)}"
 
     conn = get_db()
+    requested = entity
+    how, suggestions = "existing", []
+    if not exact_entity:
+        entity, how, suggestions = resolve_entity(conn, entity)
     with conn:
-        conn.execute(
+        cur = conn.execute(
             "INSERT INTO facts (entity, category, fact, source) VALUES (?, ?, ?, ?)",
             (entity, category, fact, source)
         )
+        fact_id = cur.lastrowid
+        record_fact_env(conn, fact_id)
     sync_facts_json()
 
     today_str = datetime.now().strftime("%Y-%m-%d")
@@ -951,7 +1177,16 @@ def remember(fact: str, entity: str = None, category: str = "Knowledge", source:
 
     ingest_file(today_file)
     okf_refresh_quiet()
-    return True
+    deprecated = None
+    try:
+        row = conn.execute("SELECT concept_id, status FROM concepts WHERE origin = 'facts' AND entities LIKE ?",
+                           (f'%{json.dumps(entity)[1:-1]}%',)).fetchone()
+        if row and row["status"] == "deprecated":
+            deprecated = row["concept_id"]
+    except Exception:
+        pass
+    return {"id": fact_id, "entity": entity, "requested_entity": requested, "resolution": how,
+            "suggestions": suggestions, "category": category, "fact": fact, "deprecated_concept": deprecated}
 
 def forget(target: str = None, entity: str = None, fact_id: int = None, category: str = None):
     """Deletes matching facts or a specific fact by ID, syncs facts.json, and records an invalidation log."""
@@ -1012,7 +1247,8 @@ def correct(entity: str = None, new_fact: str = None, old_fact_search: str = Non
     """Corrects/supersedes an existing memory with a new finding by ID or entity search."""
     conn = get_db()
     cat_map = {"fix": "Fix", "rule": "Rule", "knowledge": "Knowledge", "project": "Project"}
-    category = cat_map.get(str(category).lower(), str(category).capitalize() if category else "Fix")
+    # None keeps an existing fact's category when correcting by ID (previously this silently reset it to Fix).
+    category = cat_map.get(str(category).lower(), str(category).capitalize()) if category else None
 
     # Auto-detect numeric ID in entity (e.g. `brain correct 42 "new fact"`)
     if fact_id is None and entity:
@@ -1036,18 +1272,23 @@ def correct(entity: str = None, new_fact: str = None, old_fact_search: str = Non
                 "UPDATE facts SET entity = ?, category = ?, fact = ?, source = ?, timestamp = CURRENT_TIMESTAMP WHERE id = ?",
                 (use_entity, use_cat, new_fact, source, fact_id)
             )
+            record_fact_env(conn, fact_id)
         elif old_fact_search:
+            category = category or "Fix"
             conn.execute("DELETE FROM facts WHERE entity = ? AND fact LIKE ?", (entity, f"%{old_fact_search}%"))
-            conn.execute(
+            cur = conn.execute(
                 "INSERT INTO facts (entity, category, fact, source) VALUES (?, ?, ?, ?)",
                 (entity, category, new_fact, source)
             )
+            record_fact_env(conn, cur.lastrowid)
         else:
+            category = category or "Fix"
             conn.execute("DELETE FROM facts WHERE entity = ? AND category = ?", (entity, category))
-            conn.execute(
+            cur = conn.execute(
                 "INSERT INTO facts (entity, category, fact, source) VALUES (?, ?, ?, ?)",
                 (entity, category, new_fact, source)
             )
+            record_fact_env(conn, cur.lastrowid)
 
     sync_facts_json()
 
@@ -1303,6 +1544,12 @@ def search_brain(query: str, top_k: int = 5, entity: str = None, category: str =
                 (*fact_params, top_k)
             ).fetchall()]
 
+    if facts_rows:
+        drift = fact_drift_map(conn, facts_rows)
+        for f in facts_rows:
+            if f["id"] in drift:
+                f["env_warning"] = drift[f["id"]]
+
     return {
         "chunks": [{"score": round(score, 4), **{k: v for k, v in doc.items() if k != 'embedding'}} for score, doc in top_docs],
         "facts": facts_rows
@@ -1506,7 +1753,7 @@ def okf_signature(facts: list, meta: dict, projects: dict) -> str:
     h = hashlib.sha256()
     h.update(f"{BRAIN_VERSION}|{OKF_BUILD_REV}".encode())
     for f in facts:
-        h.update(f"{f['id']}|{f['entity']}|{f['category']}|{f['timestamp']}|{f['fact']}\n".encode("utf-8", "ignore"))
+        h.update(f"{f['id']}|{f['entity']}|{f['category']}|{f['timestamp']}|{f['fact']}|{f.get('kernel')}|{f.get('nvidia')}\n".encode("utf-8", "ignore"))
     h.update(json.dumps(meta, sort_keys=True).encode())
     for slug in sorted(projects):
         p = projects[slug]
@@ -1631,7 +1878,10 @@ def okf_render_concept(c: dict) -> str:
         for f in buckets[sec]:
             extra = f" [{f['category']}]" if sec == "Other Notes" else ""
             ent = f" ({f['entity']})" if len(c.get("entities") or []) > 1 else ""
-            lines.append(f"- [#{f['id']}] {_fact_date(f['timestamp'])}{extra}{ent} · {' '.join(str(f['fact']).split())}")
+            envtag = ""
+            if f.get("kernel") and is_system_fact(str(f["fact"]), c["concept_id"].startswith("projects/")):
+                envtag = f" (kernel {f['kernel'].split('-')[0]}" + (f", NVIDIA {f['nvidia']}" if f.get("nvidia") and re.search(r"nvidia|cuda|gsp|nvdec|nvenc|prime", str(f["fact"]), re.I) else "") + ")"
+            lines.append(f"- [#{f['id']}] {_fact_date(f['timestamp'])}{extra}{ent}{envtag} · {' '.join(str(f['fact']).split())}")
         lines.append("")
     if c.get("map_outline"):
         lines.append("## Project Map\n")
@@ -1653,7 +1903,9 @@ def okf_build(embed: bool = True, force: bool = False) -> dict:
     Skips all work when the facts/meta/project signature is unchanged (cheap to call before every read)."""
     ensure_dirs()
     conn = get_db()
-    facts = [dict(r) for r in conn.execute("SELECT id, entity, category, fact, source, timestamp FROM facts ORDER BY id").fetchall()]
+    facts = [dict(r) for r in conn.execute(
+        "SELECT f.id, f.entity, f.category, f.fact, f.source, f.timestamp, e.kernel, e.nvidia FROM facts f "
+        "LEFT JOIN fact_env e ON e.fact_id = f.id ORDER BY f.id").fetchall()]
     meta = get_okf_meta(conn)
     projects = discover_projects()
     signature = okf_signature(facts, meta, projects)
@@ -2012,6 +2264,126 @@ def okf_resolve(conn, target: str) -> tuple[list[dict], list[str]]:
     sugg += [r["title"] for r in rows if tl and tl in (r["title"] or "").lower() and r["title"] not in sugg][:5]
     return [], sugg[:6]
 
+def concept_entity(row: dict) -> str:
+    """The canonical entity name facts of a generated concept are filed under."""
+    ents = json.loads(row.get("entities") or "[]")
+    if row["concept_id"].endswith("/overview"):
+        return ents[0] if ents else row["title"]
+    return row["title"] if row["title"] in ents or not ents else ents[0]
+
+def okf_merge(sources: list[str], target: str, dry_run: bool = False, create: bool = False) -> dict:
+    """Folds the facts of one or more concepts/groups/entities into a target concept by renaming their
+    entity. Fact IDs, text, categories and timestamps are unchanged; overrides of merged-away entities are dropped."""
+    okf_build(embed=False)
+    conn = get_db()
+    thits, tsugg = okf_resolve(conn, target)
+    thits = [h for h in thits if h["origin"] == "facts"]
+    if create and len(thits) != 1:
+        # Consolidate into a new, better-named entity (e.g. ten "Shopify Video …" variants -> "Shopify Horizon Video").
+        trow = {"key": None, "concept_id": f"(new) {slugify(target)}"}
+        tentity, tents = target.strip(), set()
+    elif len(thits) != 1:
+        return {"ok": False, "error": f"Target '{target}' must match exactly one generated concept "
+                f"(matched {len(thits)})." + (f" Suggestions: {', '.join(tsugg)}" if tsugg else "")
+                + " Use --create to fold into a new entity with that name."}
+    else:
+        trow = thits[0]
+        tentity = concept_entity(trow)
+        tents = set(json.loads(trow["entities"] or "[]"))
+    move, unresolved = set(), []
+    for src in sources:
+        hits, _ = okf_resolve(conn, src)
+        hits = [h for h in hits if h["origin"] == "facts" and h["key"] != trow["key"]]
+        ents = {e for h in hits for e in json.loads(h["entities"] or "[]")}
+        if not ents:
+            ents = {r[0] for r in conn.execute("SELECT DISTINCT entity FROM facts WHERE entity = ? COLLATE NOCASE", (src,)).fetchall()}
+        ents -= tents
+        if not ents:
+            unresolved.append(src)
+        move |= ents
+    if not move:
+        return {"ok": False, "error": f"Nothing to merge (unresolved: {', '.join(unresolved) or 'none'})."}
+    ids = [r[0] for r in conn.execute(
+        f"SELECT id FROM facts WHERE entity IN ({','.join('?' * len(move))}) ORDER BY id", sorted(move)).fetchall()]
+    plan = {"ok": True, "target": trow["concept_id"], "target_entity": tentity, "entities": sorted(move),
+            "fact_ids": ids, "unresolved": unresolved, "dry_run": dry_run}
+    if dry_run:
+        return plan
+    with conn:
+        conn.execute(f"UPDATE facts SET entity = ? WHERE entity IN ({','.join('?' * len(move))})", (tentity, *sorted(move)))
+        for e in move:
+            if slugify(e) != slugify(tentity):
+                conn.execute("DELETE FROM okf_meta WHERE slug = ?", (slugify(e),))
+    sync_facts_json()
+    append_episode(f"**[Merge]** Folded {len(ids)} fact(s) from {', '.join(sorted(move))} into ({tentity}): "
+                   + ", ".join(f"#{i}" for i in ids))
+    plan["build"] = okf_build(embed=True)
+    new_row = conn.execute("SELECT concept_id FROM concepts WHERE origin = 'facts' AND entities LIKE ?",
+                           (f'%{json.dumps(tentity)[1:-1]}%',)).fetchone()
+    if new_row:
+        plan["target"] = new_row[0]
+    return plan
+
+def okf_duplicate_candidates(min_ratio: float = 0.8) -> list[dict]:
+    """Clusters of generated topic concepts that look like variants of one entity: equal after dropping
+    suffix words, near-identical names, or one name extending the other. Project children are excluded
+    (they are already grouped under their project)."""
+    conn = get_db()
+    rows = [dict(r) for r in conn.execute(
+        "SELECT key, concept_id, title, entities, fact_ids, status FROM concepts WHERE origin = 'facts' AND concept_id LIKE 'topics/%'").fetchall()]
+    parent = {r["key"]: r["key"] for r in rows}
+
+    def find(k):
+        while parent[k] != k:
+            parent[k] = parent[parent[k]]
+            k = parent[k]
+        return k
+
+    reasons = {}
+    for i, a in enumerate(rows):
+        for b in rows[i + 1:]:
+            sa, sb = slugify(a["title"]), slugify(b["title"])
+            why = None
+            if entity_key(a["title"]) == entity_key(b["title"]):
+                why = "same name without suffix words"
+            elif difflib.SequenceMatcher(None, sa, sb).ratio() >= max(min_ratio, 0.88):
+                why = "near-identical names"
+            elif min(sa, sb, key=len).count("-") >= 1 and (sa.startswith(sb + "-") or sb.startswith(sa + "-")):
+                why = "one name extends the other"  # shorter name must be 2+ words ('flutter' vs 'flutter-ui-…' is not a dupe)
+            if why:
+                parent[find(a["key"])] = find(b["key"])
+                reasons.setdefault(find(b["key"]), set()).add(why)
+    clusters = {}
+    for r in rows:
+        clusters.setdefault(find(r["key"]), []).append(r)
+    out = []
+    for root, members in clusters.items():
+        if len(members) < 2:
+            continue
+        members.sort(key=lambda r: (-len(json.loads(r["fact_ids"] or "[]")), len(r["title"])))
+        target = members[0]
+        out.append({"target": target["concept_id"], "target_title": target["title"],
+                    "members": [{"concept_id": m["concept_id"], "title": m["title"], "facts": len(json.loads(m["fact_ids"] or "[]")),
+                                 "status": m["status"]} for m in members],
+                    "reasons": sorted({w for m in members for w in reasons.get(find(m["key"]), set())}),
+                    "command": "brain okf merge " + " ".join(json.dumps(m["concept_id"]) for m in members[1:]) + f" --into {json.dumps(target['concept_id'])}"})
+    out = sorted(out, key=lambda c: -len(c["members"]))
+    # Sprawl: topic groups made of many one-fact concepts are usually one topic split by naming drift.
+    groups = {}
+    for r in rows:
+        parts = r["concept_id"].split("/")
+        if len(parts) == 3:
+            groups.setdefault(parts[1], []).append(r)
+    for g, members in sorted(groups.items()):
+        sizes = sorted(len(json.loads(m["fact_ids"] or "[]")) for m in members)
+        if len(members) >= 4 and sizes[len(sizes) // 2] <= 1:
+            out.append({"kind": "group", "target": f"topics/{g}", "target_title": f"topics/{g}",
+                        "members": [{"concept_id": m["concept_id"], "title": m["title"], "facts": len(json.loads(m["fact_ids"] or "[]")),
+                                     "status": m["status"]} for m in members],
+                        "reasons": [f"{len(members)} concepts, median {sizes[len(sizes) // 2]} fact each — likely one topic split by naming"],
+                        "command": f"brain okf merge topics/{g} --into \"<Consolidated Name>\" --create"})
+    return out
+
 def okf_concept_flags(row: dict, now: datetime = None) -> list[str]:
     flags = []
     if row.get("status") and row["status"] != "stable":
@@ -2099,9 +2471,25 @@ def quick_map(query: str = None, target_dir: Path = None, top_n: int = 5, max_it
         result["groups"] = [{"section": k[0], "group": k[1], **v} for k, v in sorted(groups.items(), key=lambda kv: kv[1]["latest"], reverse=True)]
         result["recent"] = [concept_brief(r) for r in sorted(rows, key=lambda r: r["generated_at"] or "", reverse=True)[:8]]
         result["flagged"] = [concept_brief(r) for r in rows if okf_concept_flags(r, now)]
+        # Post-upgrade check: system facts (in live concepts) recorded on an older kernel series / NVIDIA major.
+        now_env = current_env()
+        result["env"] = now_env
+        live_ids = []
+        for r in rows:
+            if r["origin"] == "facts" and r["status"] != "deprecated":
+                live_ids.extend(json.loads(r["fact_ids"] or "[]"))
+        drifted = []
+        if live_ids:
+            frows = [dict(x) for x in conn.execute(
+                f"SELECT id, entity, category, fact FROM facts WHERE id IN ({','.join('?' * len(live_ids))})", live_ids).fetchall()]
+            drift = fact_drift_map(conn, frows, now_env)
+            drifted = [{"id": f["id"], "entity": f["entity"], "category": f["category"], "warning": drift[f["id"]]} for f in frows if f["id"] in drift]
+        result["env_drift"] = drifted
         return result
 
     result["mode"] = "query"
+    now_env = current_env()
+    result["env"] = now_env
     qvec = get_embedding(query)
     res = search_brain(query, top_k=12, query_vec=qvec)
 
@@ -2197,9 +2585,12 @@ def quick_map(query: str = None, target_dir: Path = None, top_n: int = 5, max_it
                     ranked = sorted(zip(sims, frows), key=lambda x: (x[1]["id"] in hit_ids, x[0]), reverse=True)
                 else:
                     ranked = [(0.0, fr) for fr in sorted(frows, key=lambda fr: fr["timestamp"] or "", reverse=True)]
+                drift = fact_drift_map(conn, [{"id": fr["id"], "fact": fr["fact"]} for fr in frows], now_env)
                 for sim, fr in ranked[:max_items]:
                     evidence.append({"kind": "fact", "id": fr["id"], "category": fr["category"], "entity": fr["entity"],
-                                     "text": fr["fact"], "date": _fact_date(fr["timestamp"])})
+                                     "text": fr["fact"], "date": _fact_date(fr["timestamp"]), "env_warning": drift.get(fr["id"])})
+                if drift and r["status"] != "deprecated":
+                    item["flags"].append(f"{len(drift)} fact(s) from an older kernel/driver")
         for c in chunk_hits.get(key, [])[:max(0, max_items - len(evidence)) or 1]:
             evidence.append({"kind": "chunk", "file": c["file_path"], "header": c.get("header"), "text": c.get("content", "")})
         item["evidence"] = evidence[:max_items + 1]
@@ -2211,7 +2602,8 @@ def quick_map(query: str = None, target_dir: Path = None, top_n: int = 5, max_it
         if f.get("score", 0.0) < QUICKMAP_OTHER_FACT_FLOOR:
             continue
         if entity_key.get(slugify(f["entity"] or "General")) not in chosen_set:
-            result["other_facts"].append({"id": f["id"], "category": f["category"], "entity": f["entity"], "text": f["fact"]})
+            result["other_facts"].append({"id": f["id"], "category": f["category"], "entity": f["entity"], "text": f["fact"],
+                                          "env_warning": f.get("env_warning")})
     for c in res["chunks"]:
         if c.get("score", 0.0) < QM_DOC_FLOOR:
             continue
@@ -2245,7 +2637,8 @@ def render_quick_map(qm: dict, snippet_chars: int = 220) -> str:
             for e in c.get("evidence", []):
                 if e["kind"] == "fact":
                     ent = f" ({e['entity']})" if e["entity"] != c["title"] else ""
-                    out.append(f"   • [#{e['id']}] [{e['category']}]{ent} {e['date']}: {_clip(e['text'], snippet_chars)}")
+                    warn = f" ⚠ {e['env_warning']}" if e.get("env_warning") else ""
+                    out.append(f"   • [#{e['id']}] [{e['category']}]{ent} {e['date']}{warn}: {_clip(e['text'], snippet_chars)}")
                 else:
                     out.append(f"   • 📄 {Path(e['file']).name} > {e.get('header')}: {_clip(e['text'], snippet_chars - 40)}")
             if c.get("related"):
@@ -2253,7 +2646,8 @@ def render_quick_map(qm: dict, snippet_chars: int = 220) -> str:
         if qm.get("other_facts"):
             out.append("\n📌 Other matching facts:")
             for f in qm["other_facts"]:
-                out.append(f"   • [#{f['id']}] [{f['category']}] ({f['entity']}): {_clip(f['text'], snippet_chars - 40)}")
+                warn = f" ⚠ {f['env_warning']}" if f.get("env_warning") else ""
+                out.append(f"   • [#{f['id']}] [{f['category']}] ({f['entity']}){warn}: {_clip(f['text'], snippet_chars - 40)}")
         if qm.get("documents"):
             out.append("\n📄 Other documents:")
             for d in qm["documents"]:
@@ -2298,8 +2692,53 @@ def render_quick_map(qm: dict, snippet_chars: int = 220) -> str:
                 out.append(f"   • {c['title']} [{c['concept_id']}] {c['age']}: {_clip(c['description'], 110)}")
         if qm.get("flagged"):
             out.append(f"\n⚠ Flagged concepts ({len(qm['flagged'])}): " + ", ".join(f"{c['title']} ({'/'.join(c['flags'])})" for c in qm["flagged"][:10]))
+        if qm.get("env_drift"):
+            env = qm.get("env") or {}
+            by_ent = {}
+            for d in qm["env_drift"]:
+                by_ent.setdefault(d["entity"], []).append(d["id"])
+            out.append(f"\n🔧 Re-verify after upgrade — {len(qm['env_drift'])} system fact(s) were recorded on an older kernel series"
+                       f" or NVIDIA driver (running kernel {env.get('kernel')}" + (f", NVIDIA {env.get('nvidia')}" if env.get("nvidia") else "") + "):")
+            for ent, ids in sorted(by_ent.items(), key=lambda kv: -len(kv[1]))[:8]:
+                out.append(f"   • {ent}: " + ", ".join(f"#{i}" for i in ids[:8]) + ("…" if len(ids) > 8 else ""))
+            out.append("   Still valid? `brain reverify <id>...`  ·  Changed? `brain correct --id <N> \"...\"`  ·  Obsolete? `brain okf set <concept> --status deprecated`")
         out.append("\n💡 brain quickmap \"<question>\" for a ranked map · brain okf show <concept_id|group> to open one")
     return "\n".join(out) + "\n"
+
+def render_quick_map_fitted(qm: dict, max_tokens: int = None) -> str:
+    """Renders the quick map within a token budget by degrading gracefully (drop other documents, other
+    facts, related lists, shorten snippets, fewer evidence items, fewer concepts) before hard truncation."""
+    if not max_tokens:
+        return render_quick_map(qm)
+    budget = max_tokens * 4
+    q = json.loads(json.dumps(qm, default=str))
+    snippet = 220
+
+    def cap_evidence(n):
+        for c in q.get("concepts", []):
+            c["evidence"] = (c.get("evidence") or [])[:n]
+
+    steps = [
+        lambda: None,
+        lambda: q.update(documents=[]),
+        lambda: q.update(other_facts=[]),
+        lambda: [c.update(related=[]) for c in q.get("concepts", [])],
+        lambda: cap_evidence(2),
+        lambda: q.update(concepts=q.get("concepts", [])[:4], recent=(q.get("recent") or [])[:4]),
+        lambda: cap_evidence(1),
+        lambda: q.update(concepts=q.get("concepts", [])[:3], groups=(q.get("groups") or [])[:8], map_outline=(q.get("map_outline") or [])[:10]),
+        lambda: q.update(concepts=q.get("concepts", [])[:2], recent=[]),
+        lambda: q.update(concepts=q.get("concepts", [])[:1]),
+    ]
+    for step in steps:
+        step()
+        for snippet in (220, 160, 110):
+            text = render_quick_map(q, snippet_chars=snippet)
+            first = step is steps[0] and snippet == 220
+            note = "" if first else f"(condensed to fit --max-tokens {max_tokens}; raise it or use --json for everything)\n"
+            if len(text) + len(note) <= budget:
+                return text + note
+    return apply_token_budget(render_quick_map(q, snippet_chars=110), max_tokens)
 
 def okf_validate(bundle_dir: Path) -> dict:
     """OKF v0.2 §11 conformance check. Errors break conformance; warnings are soft guidance."""
@@ -2675,11 +3114,13 @@ def apply_token_budget(text: str, max_tokens: int = None) -> str:
     if len(text) <= max_chars:
         return text
 
-    slice_point = text.rfind("\n", 0, max_chars)
-    if slice_point == -1 or slice_point < max_chars // 2:
-        slice_point = max_chars
+    notice = f"\n\n[... output truncated: reached limit of --max-tokens {max_tokens} ...]"
+    limit = max(0, max_chars - len(notice))  # the notice counts toward the budget
+    slice_point = text.rfind("\n", 0, limit)
+    if slice_point == -1 or slice_point < limit // 2:
+        slice_point = limit
 
-    return text[:slice_point] + f"\n\n[... output truncated: reached limit of --max-tokens {max_tokens} ...]"
+    return text[:slice_point] + notice
 
 def atomic_write_file(path: Path, content: str):
     """Atomically writes content to a file, creating a .bak backup."""
@@ -3232,77 +3673,79 @@ def get_paths_info(target_dir: Path = None) -> dict:
         "recommendations": recommendations
     }
 
+ROLE_QUERIES = {
+    "hardware": "kernel driver firmware udev modprobe bluetooth wifi audio pipewire nvidia suspend acpi usb pcie",
+    "backend": "backend api server database sqlite fastapi docker deploy service systemd",
+    "frontend": "frontend ui css javascript html react flutter browser dom layout",
+    "security": "security permission credential secret auth token policy firewall",
+}
+ROLE_ALIASES = {"system": "hardware", "kernel": "hardware", "audio": "hardware", "wifi": "hardware", "bluetooth": "hardware",
+                "api": "backend", "web": "frontend", "ui": "frontend", "browser": "frontend", "audit": "security"}
+
+def select_role_facts(conn, role_norm: str, st: dict, limit: int = 30) -> list[dict]:
+    """Rules/fixes for a subagent: the active project's first, then role-relevant (hybrid-ranked) ones,
+    newest first otherwise. Facts in deprecated OKF concepts are skipped."""
+    deprecated = set()
+    for r in conn.execute("SELECT entities FROM concepts WHERE origin = 'facts' AND status = 'deprecated'").fetchall():
+        deprecated |= set(json.loads(r[0] or "[]"))
+    picked, seen = [], set()
+
+    def add(rows):
+        for f in rows:
+            f = dict(f)
+            if f["id"] in seen or f["entity"] in deprecated:
+                continue
+            seen.add(f["id"])
+            picked.append(f)
+
+    proj_path = st.get("project_path") if "error" not in st else None
+    if proj_path:
+        prow = conn.execute("SELECT fact_ids FROM concepts WHERE origin = 'facts' AND resource = ?",
+                            (Path(proj_path).resolve().as_uri(),)).fetchone()
+        ids = json.loads(prow[0] or "[]") if prow else []
+        if ids:
+            add(conn.execute(f"SELECT id, entity, category, fact, timestamp FROM facts WHERE id IN ({','.join('?' * len(ids))}) "
+                             "AND category IN ('Rule', 'Fix') ORDER BY category = 'Rule' DESC, timestamp DESC LIMIT 8", ids).fetchall())
+    role_key = ROLE_ALIASES.get(role_norm, role_norm)
+    if role_key in ROLE_QUERIES:
+        q = ROLE_QUERIES[role_key]
+        add(rank_facts(conn, q, get_embedding(q), ["f.category IN ('Rule', 'Fix')"], [], limit))
+    add(conn.execute("SELECT id, entity, category, fact, timestamp FROM facts WHERE category IN ('Rule', 'Fix') "
+                     "ORDER BY timestamp DESC, id DESC LIMIT ?", (limit,)).fetchall())
+    return picked[:limit]
+
 def generate_role_context(role: str = "general", target_dir: Path = None, max_tokens: int = 800) -> str:
-    """Generates a compact, role-tailored system prompt snippet for subagent context injection."""
+    """Compact, role-tailored system prompt snippet for subagent context injection.
+    Budget-aware: the fixed sections are always kept whole and the rules section is filled with one-line
+    fact summaries until the token budget is reached (instead of truncating the tail)."""
     role_norm = (role or "general").strip().lower()
     st = get_project_state(target_dir)
+    conn = get_db()
 
-    lines = [
-        f"# AGENT CONTEXT INJECTION: {role_norm.upper()}",
-        "",
-        "## 1. System Platform & Hardware Facts",
-        "- **OS:** Arch Linux (Rolling release).",
-        "- **Platform:** ASUS TUF Gaming A15 (FA506NFR) - AMD CPU + NVIDIA GPU.",
-        "- **Wi-Fi & Bluetooth:** MediaTek MT7921 802.11ax PCIe (`14c3:7961`, `mt7921e`) and USB Bluetooth (`13d3:3563`, driver `btusb` / `btmtk`). (Decommissioned Realtek RTL8852BE).",
-        "- **ACPI Sleep:** S0 (s2idle), S4, S5. (ACPI DSDT does NOT support S3 deep sleep).",
-        ""
+    env = current_env()
+    home = str(Path.home())
+    short = lambda p: str(p).replace(home, "~", 1)
+    head = [
+        f"# AGENT CONTEXT: {role_norm.upper()}",
+        "## 1. Platform",
+        "- Arch Linux · ASUS TUF A15 FA506NFR (AMD CPU + NVIDIA GPU) · kernel " + env["kernel"]
+        + (f" · NVIDIA {env['nvidia']}" if env.get("nvidia") else ""),
+        "- Wi-Fi/BT: MediaTek MT7921 (`14c3:7961`, `mt7921e`) + USB BT (`13d3:3563`, `btusb`/`btmtk`); Realtek RTL8852BE removed.",
+        "- ACPI sleep: S0 (s2idle), S4, S5 only (no S3).",
+        "## 2. Project",
     ]
-
-    lines.append("## 2. Active Project Context")
     if "error" not in st:
-        proj_path = st.get("project_path", "")
-        res_file = st.get("resolved_file", "")
-        f_type = st.get("file_type", "")
-        lines.append(f"- **Project Root:** {proj_path}")
-        lines.append(f"- **State Source:** {res_file} ({f_type})")
+        head.append(f"- Root `{short(st.get('project_path', ''))}` · state `{short(st.get('resolved_file', ''))}` ({st.get('file_type', '')})")
         content = st.get("content", "")
         phase_m = re.search(r"\*\*Active Phase:\*\*\s*([^\n]+)", content)
         status_m = re.search(r"\*\*Status:\*\*\s*([^\n]+)", content)
-        if phase_m:
-            lines.append(f"- **Active Phase:** {phase_m.group(1).strip()}")
-        if status_m:
-            lines.append(f"- **Status:** {status_m.group(1).strip()}")
+        if phase_m or status_m:
+            head.append(f"- Phase: {phase_m.group(1).strip() if phase_m else '?'} · Status: {status_m.group(1).strip() if status_m else '?'}")
     else:
-        lines.append("- **Status:** No active .planning/ or project_map.md detected.")
-    lines.append("")
-
-    conn = get_db()
-    facts = []
-    if role_norm in ["hardware", "system", "kernel", "audio", "wifi", "bluetooth"]:
-        facts = conn.execute("""
-            SELECT id, entity, category, fact FROM facts 
-            WHERE category IN ('Fix', 'Rule') 
-              AND (entity LIKE '%Bluetooth%' OR entity LIKE '%Wi-Fi%' OR entity LIKE '%Audio%' 
-                   OR entity LIKE '%PipeWire%' OR entity LIKE '%udev%' OR entity LIKE '%Hardware%'
-                   OR fact LIKE '%driver%' OR fact LIKE '%kernel%' OR fact LIKE '%udev%')
-            ORDER BY id DESC LIMIT 6
-        """).fetchall()
-    elif role_norm in ["frontend", "web", "ui", "browser"]:
-        facts = conn.execute("""
-            SELECT id, entity, category, fact FROM facts 
-            WHERE category IN ('Fix', 'Rule', 'Knowledge')
-              AND (entity LIKE '%Web%' OR entity LIKE '%Frontend%' OR fact LIKE '%Chrome%' 
-                   OR fact LIKE '%CSS%' OR fact LIKE '%DOM%' OR fact LIKE '%UI%')
-            ORDER BY id DESC LIMIT 6
-        """).fetchall()
-    elif role_norm in ["security", "audit"]:
-        facts = conn.execute("""
-            SELECT id, entity, category, fact FROM facts 
-            WHERE category IN ('Rule', 'Fix') 
-              AND (entity LIKE '%Security%' OR fact LIKE '%permission%' OR fact LIKE '%credential%'
-                   OR fact LIKE '%secret%' OR fact LIKE '%D-Bus%' OR fact LIKE '%policy%')
-            ORDER BY id DESC LIMIT 6
-        """).fetchall()
-    else:
-        facts = conn.execute("""
-            SELECT id, entity, category, fact FROM facts 
-            WHERE category IN ('Fix', 'Rule')
-            ORDER BY id DESC LIMIT 5
-        """).fetchall()
-
-    lines.append("## 3. Knowledge Map (OKF)")
+        head.append("- No .planning/ or project_map.md here.")
+    head += ["## 3. Knowledge Map (OKF)"]
     n_concepts = conn.execute("SELECT COUNT(*) FROM concepts").fetchone()[0]
-    lines.append(f"- **Bundle:** `{OKF_DIR}/index.md` ({n_concepts} concepts). Orient first with `brain quickmap \"<task>\"`; open one with `brain okf show <concept_id>`.")
+    head.append(f"- {n_concepts} concepts in `{short(OKF_DIR)}`. Orient: `brain quickmap \"<task>\"` · open: `brain okf show <id>`.")
     proj_path = st.get("project_path") if "error" not in st else None
     if proj_path:
         prow = conn.execute("SELECT concept_id, fact_ids, links FROM concepts WHERE origin = 'facts' AND resource = ?",
@@ -3310,28 +3753,34 @@ def generate_role_context(role: str = "general", target_dir: Path = None, max_to
         if prow:
             rel = [conn.execute("SELECT title FROM concepts WHERE key = ?", (k,)).fetchone() for k in json.loads(prow["links"] or "[]")[:6]]
             rel_titles = ", ".join(r[0] for r in rel if r)
-            lines.append(f"- **Project concept:** `{prow['concept_id']}` ({len(json.loads(prow['fact_ids'] or '[]'))} facts)" + (f"; related: {rel_titles}" if rel_titles else ""))
-    lines.append("")
+            head.append(f"- Project concept `{prow['concept_id']}` ({len(json.loads(prow['fact_ids'] or '[]'))} facts)" + (f"; related: {rel_titles}" if rel_titles else ""))
 
-    lines.append(f"## 4. Verified Rules & Fixes ({role_norm})")
-    if facts:
-        for f in facts:
-            lines.append(f"- [#{f['id']}] **[{f['category']}]** ({f['entity']}): {f['fact']}")
-    else:
-        lines.append("- No specific rules found. Query dynamically via `brain query`.")
-    lines.append("")
-
-    lines.extend([
-        "## 5. Execution Directives",
-        "- **Spec-Driven Loop:** DISCUSS -> PLAN -> EXECUTE -> VERIFY -> SHIP & REMEMBER.",
-        "- **Quality Gates:** Empirically verify all code and commands before completing tasks.",
-        "- **Memory Persistence:** When resolving issues, persist verified findings via:",
-        '  `brain remember "<fact>" --entity "<Topic>" --category "<Fix|Rule>"`',
-        ""
-    ])
-
-    raw_text = "\n".join(lines)
-    return apply_token_budget(raw_text, max_tokens)
+    tail = [
+        "## 5. Directives",
+        "- Loop: DISCUSS → PLAN → EXECUTE → VERIFY → SHIP & REMEMBER. Verify empirically before calling anything done.",
+        '- Persist verified findings: `brain remember "<fact>" -e "<Topic>" --fix|--rule`; fix old ones: `brain correct --id <N> "..."`.',
+        "- ⚠ on a fact = recorded on another kernel/driver: re-check it before relying on it.",
+    ]
+    section_title = f"## 4. Rules & Fixes ({role_norm})"
+    budget = (max_tokens or 800) * 4
+    room = budget - len("\n".join(head + [section_title] + tail)) - 110
+    facts = select_role_facts(conn, role_norm, st)
+    drift = fact_drift_map(conn, facts, env)
+    body, used = [], 0
+    for f in facts:
+        warn = f" ⚠ {drift[f['id']]}" if f["id"] in drift else ""
+        text = re.sub(r"\s#[A-Za-z][\w-]*", "", str(f["fact"]))
+        line = f"- [#{f['id']}] {f['category']} · {f['entity']}{warn}: {_clip(text, 160)}"
+        if used + len(line) + 1 > room:
+            break
+        body.append(line)
+        used += len(line) + 1
+    omitted = len(facts) - len(body)
+    if not body:
+        body.append("- No specific rules found. Query dynamically via `brain quickmap \"<task>\"`.")
+    if omitted > 0:
+        body.append(f"- …{omitted} more: `brain quickmap \"<task>\"`.")
+    return apply_token_budget("\n".join(head + [section_title] + body + tail), max_tokens)
 
 def clean_orphans(dry_run: bool = False):
     """Finds indexed files that no longer exist on disk and purges their chunks & FTS entries."""
@@ -3729,6 +4178,10 @@ def sync_brain():
     backfilled_count = backfill_missing_embeddings()
     backfilled_count += ensure_fact_vectors()
     try:
+        backfill_fact_env()
+    except Exception as e:
+        print(f"[Brain Warning] fact environment backfill failed: {e}", file=sys.stderr)
+    try:
         okf_stats = okf_build(embed=True)
     except Exception as e:
         okf_stats = {"error": str(e)}
@@ -3948,7 +4401,9 @@ def run_doctor(fix: bool = False) -> tuple[bool, dict]:
 
     # 8. OKF Knowledge Bundle (current, conformant, concept vectors complete)
     try:
-        facts_now = [dict(r) for r in conn.execute("SELECT id, entity, category, fact, source, timestamp FROM facts ORDER BY id").fetchall()]
+        facts_now = [dict(r) for r in conn.execute(
+            "SELECT f.id, f.entity, f.category, f.fact, f.source, f.timestamp, e.kernel, e.nvidia FROM facts f "
+            "LEFT JOIN fact_env e ON e.fact_id = f.id ORDER BY f.id").fetchall()]
         current = get_brain_meta(conn, "okf_signature") == okf_signature(facts_now, get_okf_meta(conn), discover_projects())
         val = okf_validate(OKF_DIR) if (OKF_DIR / "index.md").exists() else {"conformant": False, "errors": ["bundle not built"], "concepts": 0}
         missing_vec = conn.execute("SELECT COUNT(*) FROM concepts WHERE embedding IS NULL").fetchone()[0]
@@ -4093,6 +4548,8 @@ def list_brain_items(kind: str = "facts", category: str = None, entity: str = No
     else:
         return "error", [{"error": f"Unknown list type '{kind}'. Choose from 'facts', 'sources', 'projects', 'backups'."}]
 
+MCP_PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"]
+
 def run_mcp_server():
     """Runs a standard Model Context Protocol (MCP) JSON-RPC stdio server."""
     sys.stderr.write("Starting Central Brain MCP Server (stdio)...\n")
@@ -4103,16 +4560,21 @@ def run_mcp_server():
             line = sys.stdin.readline()
             if not line:
                 break
+            if not line.strip():
+                continue
             req = json.loads(line.strip())
             method = req.get("method")
             req_id = req.get("id")
+            if "id" not in req:
+                continue  # JSON-RPC notification (e.g. notifications/initialized): must not be answered
 
             if method == "initialize":
+                wanted = (req.get("params") or {}).get("protocolVersion")
                 resp = {
                     "jsonrpc": "2.0",
                     "id": req_id,
                     "result": {
-                        "protocolVersion": "2024-11-05",
+                        "protocolVersion": wanted if wanted in MCP_PROTOCOL_VERSIONS else MCP_PROTOCOL_VERSIONS[0],
                         "capabilities": {"tools": {}},
                         "serverInfo": {"name": "central-brain", "version": BRAIN_VERSION}
                     }
@@ -4140,15 +4602,25 @@ def run_mcp_server():
                             },
                             {
                                 "name": "brain_quickmap",
-                                "description": "Quick map (RAG + OKF): rank knowledge concepts (projects/topics) for a question and return the best [#id] facts, document hits, trust/lifecycle flags, and related concepts. Omit query for a project/overview map.",
+                                "description": "Quick map (RAG + OKF): rank knowledge concepts (projects/topics) for a question and return the best [#id] facts, document hits, trust/lifecycle flags (deprecated, stale, older-kernel), and related concepts. Omit query for a project/overview map. Start here when orienting on a task.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
                                         "query": {"type": "string", "description": "Question or keywords (optional)"},
                                         "top": {"type": "integer", "default": 5},
                                         "path": {"type": "string", "description": "Optional project path for the no-query view"},
+                                        "max_tokens": {"type": "integer", "default": 1500, "description": "Output budget; the map condenses gracefully to fit"},
                                         "format": {"type": "string", "enum": ["text", "json"], "default": "text"}
                                     }
+                                }
+                            },
+                            {
+                                "name": "brain_reverify",
+                                "description": "Mark facts as still valid on the running kernel/NVIDIA driver (after an upgrade flagged them).",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {"ids": {"type": "array", "items": {"type": "integer"}}},
+                                    "required": ["ids"]
                                 }
                             },
                             {
@@ -4169,7 +4641,9 @@ def run_mcp_server():
                                     "properties": {
                                         "fact": {"type": "string", "description": "Fact or memory to save"},
                                         "entity": {"type": "string", "default": "General"},
-                                        "category": {"type": "string", "default": "Knowledge"}
+                                        "category": {"type": "string", "default": "Knowledge"},
+                                        "tags": {"type": "array", "items": {"type": "string"}},
+                                        "exact_entity": {"type": "boolean", "default": False, "description": "Skip snapping to an existing entity variant"}
                                     },
                                     "required": ["fact"]
                                 }
@@ -4255,7 +4729,7 @@ def run_mcp_server():
                                         "id": {"type": "integer", "description": "Exact fact ID to update in-place"},
                                         "entity": {"type": "string", "description": "Entity or topic to correct"},
                                         "old_fact_search": {"type": "string", "description": "Optional keyword of the old fact to replace"},
-                                        "category": {"type": "string", "default": "Fix"}
+                                        "category": {"type": "string", "description": "Optional; by ID the fact keeps its category"}
                                     },
                                     "required": ["new_fact"]
                                 }
@@ -4316,7 +4790,7 @@ def run_mcp_server():
                     resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": json.dumps(res, indent=2)}]}}
                 elif name == "brain_quickmap":
                     qm = quick_map(args.get("query") or None, target_dir=args.get("path"), top_n=int(args.get("top", 5)))
-                    text = json.dumps(qm, indent=2, default=str) if args.get("format") == "json" else render_quick_map(qm)
+                    text = json.dumps(qm, indent=2, default=str) if args.get("format") == "json" else render_quick_map_fitted(qm, int(args.get("max_tokens", 1500)))
                     resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": text}]}}
                 elif name == "brain_okf_show":
                     okf_build(embed=False)
@@ -4334,9 +4808,18 @@ def run_mcp_server():
                         else:
                             text = f"No concept matches '{tgt}'. Suggestions: {', '.join(sugg) or 'none'}"
                     resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": text}]}}
+                elif name == "brain_reverify":
+                    done = reverify_facts([int(i) for i in args.get("ids", [])])
+                    resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": f"Re-verified on the running kernel/driver: {done or 'none found'}"}]}}
                 elif name == "brain_remember":
-                    remember(args.get("fact"), args.get("entity", "General"), args.get("category", "Knowledge"), source="MCP")
-                    resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": "Fact saved to Central Brain successfully."}]}}
+                    info = remember(args.get("fact"), args.get("entity", "General"), args.get("category", "Knowledge"), source="MCP",
+                                    tags=args.get("tags"), exact_entity=bool(args.get("exact_entity")))
+                    msg = f"Saved fact #{info['id']} [{info['category']}] under entity '{info['entity']}'."
+                    if info["resolution"] in ("normalized", "snapped"):
+                        msg += f" ('{info['requested_entity']}' was filed under the existing entity.)"
+                    elif info["suggestions"]:
+                        msg += f" New entity; similar existing: {', '.join(info['suggestions'])}."
+                    resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": msg}]}}
                 elif name == "brain_state":
                     res = get_project_state(args.get("path"))
                     if args.get("section") and "content" in res:
@@ -4368,7 +4851,7 @@ def run_mcp_server():
                     cnt = forget(args.get("target"), args.get("entity"), fact_id=args.get("id"))
                     resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": f"Purged {cnt} matching fact(s) from Central Brain."}]}}
                 elif name == "brain_correct":
-                    ok = correct(args.get("entity"), args.get("new_fact"), args.get("old_fact_search"), args.get("category", "Fix"), source="MCP", fact_id=args.get("id"))
+                    ok = correct(args.get("entity"), args.get("new_fact"), args.get("old_fact_search"), args.get("category"), source="MCP", fact_id=args.get("id"))
                     resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": "Successfully corrected memory in Central Brain." if ok else "Failed to correct memory: fact not found."}]}}
                 elif name == "brain_export":
                     digest = export_brain(days=args.get("days", 30), category=args.get("category"))
@@ -4384,13 +4867,23 @@ def run_mcp_server():
                     resp = {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": json.dumps({"kind": kind, "items": items}, indent=2)}]}}
                 else:
                     resp = {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Tool '{name}' not found"}}
-            else:
+            elif method == "ping":
                 resp = {"jsonrpc": "2.0", "id": req_id, "result": {}}
+            else:
+                resp = {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Method '{method}' not found"}}
 
             sys.stdout.write(json.dumps(resp) + "\n")
             sys.stdout.flush()
+        except json.JSONDecodeError as e:
+            sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": f"Parse error: {e}"}}) + "\n")
+            sys.stdout.flush()
         except Exception as e:
-            err_resp = {"jsonrpc": "2.0", "id": None, "error": {"code": -32603, "message": str(e)}}
+            # Tool failures are reported as an MCP tool result with isError so the client keeps the session.
+            rid = req.get("id") if isinstance(locals().get("req"), dict) else None
+            if isinstance(locals().get("req"), dict) and req.get("method") == "tools/call":
+                err_resp = {"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": f"Error: {e}"}], "isError": True}}
+            else:
+                err_resp = {"jsonrpc": "2.0", "id": rid, "error": {"code": -32603, "message": str(e)}}
             sys.stdout.write(json.dumps(err_resp) + "\n")
             sys.stdout.flush()
 
@@ -4453,6 +4946,8 @@ def main():
                                     Direct category shortcuts
          -t, --tags TAGS            Comma-separated tags to append (e.g. 'wifi,driver,kernel')
          -s, --source NAME          Origin identifier (default: 'CLI')
+         --exact-entity             Keep the entity exactly as typed (otherwise spelling variants
+                                    snap to an existing entity and near matches are suggested)
          --json                     Output in structured JSON format
 
      brain forget [<target>] [options]
@@ -4473,7 +4968,7 @@ def main():
        Options:
          --id INT                   Deterministic in-place update by exact fact ID
          -o, --old OLD              Old text substring to replace (if not using --id)
-         -c, --category CAT         Updated category: Fix, Rule, Knowledge, Project
+         -c, --category CAT         Updated category (default: keep the fact's category)
          --rule, --fix              Direct category shortcuts
          -s, --source NAME          Source identifier (default: 'CLI')
          --json                     Output in structured JSON format
@@ -4556,7 +5051,15 @@ def main():
                                       (pass an empty string to clear a field)
          verify <target> [--by ACTOR]  Record a verification (actor: human:<id>, agent/<ver>,
                                     process:<id>; defaults to human:$USER only on a TTY)
+         merge <src>... --into <t>  Fold duplicate concepts/entities/groups into one (fact IDs kept;
+                                    --dry-run to preview, --create to consolidate into a new name)
+         dupes                      List clusters of concepts that look like variants of one entity
          path                       Print the bundle path
+
+     brain reverify <id>...
+       Mark facts as re-verified on the running kernel/NVIDIA driver (text unchanged).
+       Facts record the kernel/driver they were written on; quickmap and query flag system
+       facts from an older kernel series (major.minor) or NVIDIA major with ⚠.
 
   3. SOURCES & INDEXING
      brain sources [subcommand] [args...]
@@ -4766,6 +5269,14 @@ def main():
     okf_ver.add_argument("target", type=str, help="Concept id, title, entity, or group")
     okf_ver.add_argument("--by", type=str, default=None, help="Actor: human:<id>, <agent>/<version>, or process:<id>")
     okf_ver.add_argument("--json", action="store_true", help="Output in JSON format")
+    okf_m = okf_sub.add_parser("merge", help="Fold duplicate concepts/entities into one concept (fact IDs kept)")
+    okf_m.add_argument("sources", nargs="+", help="Concept ids, titles, entities, or groups to fold in")
+    okf_m.add_argument("--into", required=True, dest="into", help="Target concept (id, title, or entity)")
+    okf_m.add_argument("--dry-run", action="store_true", help="Show what would move without changing anything")
+    okf_m.add_argument("--create", action="store_true", help="Target is a new entity name (consolidate into a fresh concept)")
+    okf_m.add_argument("--json", action="store_true", help="Output in JSON format")
+    okf_d = okf_sub.add_parser("dupes", help="List clusters of concepts that look like variants of one entity")
+    okf_d.add_argument("--json", action="store_true", help="Output in JSON format")
     okf_path = okf_sub.add_parser("path", help="Print the OKF bundle path")
     okf_path.add_argument("--json", action="store_true", help="Output in JSON format")
 
@@ -4831,6 +5342,7 @@ def main():
     r_p.add_argument("--knowledge", action="store_true", help="Shortcut for --category Knowledge")
     r_p.add_argument("-t", "--tags", type=str, default=None, metavar="TAGS", help="Comma-separated tags to append (e.g. 'wifi,driver,kernel')")
     r_p.add_argument("-s", "--source", type=str, default="CLI", help="Source identifier (default: 'CLI')")
+    r_p.add_argument("--exact-entity", action="store_true", help="Store the entity exactly as given (skip snapping to an existing variant)")
     r_p.add_argument("--json", action="store_true", help="Output in JSON format")
 
     # forget
@@ -4847,11 +5359,16 @@ def main():
     c_p.add_argument("new_fact", type=str, nargs="?", default=None, help="The new, corrected fact or solution")
     c_p.add_argument("--id", type=int, default=None, help="Deterministic in-place update by exact fact ID")
     c_p.add_argument("-o", "--old", type=str, default=None, help="Old keyword or fact to replace")
-    c_p.add_argument("-c", "--category", type=str, default="Fix", help="Category: Fix (default), Rule, Knowledge, Project")
+    c_p.add_argument("-c", "--category", type=str, default=None, help="Category: Fix, Rule, Knowledge, Project (default: keep the fact's category; Fix for new facts)")
     c_p.add_argument("--rule", action="store_true", help="Shortcut for --category Rule")
     c_p.add_argument("--fix", action="store_true", help="Shortcut for --category Fix")
     c_p.add_argument("-s", "--source", type=str, default="CLI", help="Source identifier (default: 'CLI')")
     c_p.add_argument("--json", action="store_true", help="Output in JSON format")
+
+    # reverify
+    rv_p = sub.add_parser("reverify", help="Mark facts as re-verified on the running kernel/NVIDIA driver (text unchanged)")
+    rv_p.add_argument("ids", nargs="+", help="Fact IDs (e.g. 42 #43)")
+    rv_p.add_argument("--json", action="store_true", help="Output in JSON format")
 
     # ingest
     i_p = sub.add_parser("ingest", help="Ingest markdown file or directory into vector index")
@@ -4924,7 +5441,8 @@ def main():
             out_data = res
             if is_compact:
                 out_data = {
-                    "facts": [{"id": f["id"], "category": f["category"], "entity": f["entity"], "fact": f["fact"]} for f in res.get("facts", [])],
+                    "facts": [{"id": f["id"], "category": f["category"], "entity": f["entity"], "fact": f["fact"],
+                               **({"env_warning": f["env_warning"]} if f.get("env_warning") else {})} for f in res.get("facts", [])],
                     "chunks": [{"file": Path(c["file_path"]).name, "header": c.get("header"), "snippet": c.get("content", "")[:120].strip()} for c in res.get("chunks", [])]
                 }
             json_str = json.dumps({"status": "success", "command": "query", "data": out_data, "timestamp": datetime.now().isoformat()}, indent=2)
@@ -4934,7 +5452,8 @@ def main():
                 lines = []
                 if res["facts"]:
                     for f in res["facts"]:
-                        lines.append(f"[#{f['id']}] [{f['category']}] ({f['entity']}): {f['fact']}")
+                        warn = f" ⚠ {f['env_warning']}" if f.get("env_warning") else ""
+                        lines.append(f"[#{f['id']}] [{f['category']}] ({f['entity']}){warn}: {f['fact']}")
                 if res["chunks"]:
                     for c in res["chunks"]:
                         fname = Path(c['file_path']).name
@@ -4951,7 +5470,8 @@ def main():
                 if res["facts"]:
                     out_lines.append("\n📌 RELEVANT FACTS:")
                     for f in res["facts"]:
-                        out_lines.append(f"  • [#{f['id']}] [{f['category']}] ({f['entity']}): {f['fact']} ({f['timestamp']})")
+                        warn = f" ⚠ {f['env_warning']}" if f.get("env_warning") else ""
+                        out_lines.append(f"  • [#{f['id']}] [{f['category']}] ({f['entity']}){warn}: {f['fact']} ({f['timestamp']})")
                 if res["chunks"]:
                     out_lines.append("\n📄 RELEVANT KNOWLEDGE CHUNKS:")
                     for idx, c in enumerate(res["chunks"], 1):
@@ -5186,7 +5706,7 @@ def main():
         if is_json:
             print(apply_token_budget(json.dumps({"status": "success", "command": "quickmap", "data": qm}, indent=2, default=str), args.max_tokens))
         else:
-            print(apply_token_budget(render_quick_map(qm), args.max_tokens))
+            print(render_quick_map_fitted(qm, args.max_tokens))
 
     elif args.command == "okf":
         action = getattr(args, "okf_action", None) or "show"
@@ -5200,6 +5720,35 @@ def main():
                       f"{st['written']} files written, {st['removed']} removed, {st['embedded']} embedded.")
         elif action == "path":
             print(json.dumps({"status": "success", "command": "okf", "data": {"path": str(OKF_DIR)}}) if is_json else str(OKF_DIR))
+        elif action == "merge":
+            res = okf_merge(args.sources, args.into, dry_run=args.dry_run, create=args.create)
+            if is_json:
+                print(json.dumps({"status": "success" if res.get("ok") else "error", "command": "okf", "action": "merge", "data": res}, indent=2, default=str))
+            elif not res.get("ok"):
+                print(f"❌ {res['error']}")
+            else:
+                verb = "Would fold" if args.dry_run else "Folded"
+                print(f"{'🔍' if args.dry_run else '✅'} {verb} {len(res['fact_ids'])} fact(s) from {', '.join(repr(e) for e in res['entities'])} "
+                      f"into {res['target']} (entity '{res['target_entity']}'). Fact IDs unchanged: {', '.join('#' + str(i) for i in res['fact_ids'][:20])}"
+                      + ("…" if len(res['fact_ids']) > 20 else ""))
+                if res.get("unresolved"):
+                    print(f"   ⚠ Not found: {', '.join(res['unresolved'])}")
+        elif action == "dupes":
+            okf_build(embed=False)
+            clusters = okf_duplicate_candidates()
+            if is_json:
+                print(json.dumps({"status": "success", "command": "okf", "action": "dupes", "data": clusters}, indent=2))
+            elif not clusters:
+                print("✅ No duplicate-looking concepts found.")
+            else:
+                print(f"🔎 {len(clusters)} cluster(s) of concepts that look like variants of one entity (review before merging):")
+                for c in clusters:
+                    label = "Group" if c.get("kind") == "group" else "Duplicate"
+                    print(f"\n• {label}: {c['target_title']}  [{'; '.join(c['reasons'])}]")
+                    for m in c["members"]:
+                        flag = f" [{m['status']}]" if m["status"] != "stable" else ""
+                        print(f"     - {m['concept_id']} ({m['facts']} facts){flag}")
+                    print(f"   {c['command']}")
         elif action == "validate":
             if not args.dir:
                 okf_build(embed=False)
@@ -5485,12 +6034,19 @@ def main():
         tags_str = getattr(args, "tags", None)
         tags_list = [t.strip() for t in tags_str.split(",") if t.strip()] if tags_str else None
 
-        remember(args.fact, args.entity, category, args.source, tags=tags_list)
+        info = remember(args.fact, args.entity, category, args.source, tags=tags_list, exact_entity=args.exact_entity)
         if is_json:
-            print(json.dumps({"status": "success", "command": "remember", "data": {"entity": args.entity, "category": category, "fact": args.fact, "source": args.source, "tags": tags_list}}, indent=2))
+            print(json.dumps({"status": "success", "command": "remember", "data": {**info, "source": args.source, "tags": tags_list}}, indent=2))
         else:
             tag_msg = f" (tags: {', '.join(tags_list)})" if tags_list else ""
-            print(f"✅ Saved memory to Central Brain: [{category}] ({args.entity}): {args.fact}{tag_msg}")
+            print(f"✅ Saved memory to Central Brain: [#{info['id']}] [{info['category']}] ({info['entity']}): {args.fact}{tag_msg}")
+            if info["resolution"] in ("normalized", "snapped"):
+                print(f"   ↪ Entity '{info['requested_entity']}' filed under existing '{info['entity']}' (use --exact-entity to keep it separate).")
+            elif info["resolution"] == "new" and info["suggestions"]:
+                print(f"   💡 New entity '{info['entity']}'. Similar existing: {', '.join(repr(x) for x in info['suggestions'])}. "
+                      f"If it is the same topic, fix with: brain okf merge \"{info['entity']}\" --into \"{info['suggestions'][0]}\"")
+            if info.get("deprecated_concept"):
+                print(f"   ⚠ Concept {info['deprecated_concept']} is deprecated. If this is current again: brain okf set {info['deprecated_concept']} --status stable")
 
     elif args.command == "forget":
         fact_id = getattr(args, "id", None)
@@ -5553,6 +6109,19 @@ def main():
                     print(f"✨ Central Brain: Successfully corrected memory for [{category}] ({entity}) -> {new_fact}")
             else:
                 print(f"❌ Central Brain: Could not correct memory (fact not found).")
+
+    elif args.command == "reverify":
+        ids = [int(m.group(1)) for x in args.ids for m in [re.match(r"^#?(\d+)$", x.strip())] if m]
+        done = reverify_facts(ids)
+        env = current_env()
+        missing = sorted(set(ids) - set(done))
+        if is_json:
+            print(json.dumps({"status": "success" if done else "error", "command": "reverify", "data": {"reverified": done, "not_found": missing, "env": env}}, indent=2))
+        else:
+            if done:
+                print(f"✅ Re-verified {', '.join('#' + str(i) for i in done)} on kernel {env['kernel']}" + (f", NVIDIA {env['nvidia']}" if env.get("nvidia") else ""))
+            if missing:
+                print(f"❌ Not found: {', '.join('#' + str(i) for i in missing)}")
 
     elif args.command == "ingest":
         p = Path(args.path).resolve()

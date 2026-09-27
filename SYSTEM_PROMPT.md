@@ -21,6 +21,8 @@ The `brain` tool is NOT an LLM tool/function call. Execute it directly via bash/
    - To open a concept or group from the OKF bundle (~/.central_brain/okf): `brain okf show <concept_id|group>`
    - When a whole topic is obsolete (e.g. replaced hardware), retire it instead of deleting facts:
      `brain okf set <concept|group> --status deprecated`
+   - A ⚠ "recorded on kernel X→Y" marker means the fact predates the running kernel/driver: re-check it,
+     then `brain reverify <id>` (still valid) or `brain correct --id <id> "..."` (changed).
    - To inspect project status, milestones, and blockers:
      `brain state [project_path]` (or inspect specific sections: `brain state --section "<Section>"`)
    - To inspect all storage paths and active state file resolution:
@@ -29,6 +31,8 @@ The `brain` tool is NOT an LLM tool/function call. Execute it directly via bash/
 3. **AFTER RESOLVING ISSUES OR DISCOVERING FIXES (BASH)**:
    - Persist findings immediately so they survive context resets and kernel changes:
      `brain remember "<verified_fix_or_rule>" --entity "<Topic>" --category "<Fix|Rule|Knowledge|Project>"`
+   - Reuse existing entity names (the CLI snaps spelling variants and prints similar entities); fold
+     duplicates with `brain okf merge <duplicate> --into <concept>` (fact IDs are kept).
 
 4. **CORRECTING SUPERSEDED / WRONG MEMORIES (BASH)**:
    - When a past solution is replaced or no longer works, update in-place by ID:
