@@ -91,6 +91,9 @@ brain list backups
 brain sources list                  # List registered folders & files with chunk counts
 brain sources add /path/to/docs     # Register and index new directory immediately
 brain sources remove /path/to/docs  # Unregister source and purge its chunks
+brain sources remove ~/old/checkout # Also purges ad-hoc chunks of a path that was never registered
+# Directory sources honour .gitignore (own git repos), skip node_modules/.venv/build/models/…,
+# always include .agents/ and .planning/, and skip files > 512 KB. Sync drops chunks a source no longer covers.
 
 # Query the brain across past projects & fixes (returns deterministic [#id])
 brain query "bluetooth autosuspend"
