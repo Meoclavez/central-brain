@@ -213,6 +213,23 @@ class EnvironmentDriftTests(unittest.TestCase):
         b.reverify_facts([F["wifi"]])
         self.assertNotIn(F["wifi"], b.fact_drift_map(conn, rows, ENV))
 
+    def test_drift_relevance_heuristic(self):
+        eligible = lambda text, proj=False: bool(b.env_drift(text, {"kernel": "7.1.8-arch1-1", "nvidia": "610.57.04"}, ENV, proj))
+        # kernel/driver machinery -> flagged
+        self.assertTrue(eligible("USB dongle 0a12:0001 needs a udev rule with power/control=auto"))
+        self.assertTrue(eligible("In-kernel ntfs3 driver refuses to mount dirty NTFS volumes"))
+        self.assertTrue(eligible("After updating NVIDIA drivers, Flatpak apps crash until GL.nvidia matches"))
+        # not kernel-series dependent -> not flagged
+        self.assertFalse(eligible("sysctl kernel.yama.ptrace_scope=0 and kernel.dmesg_restrict=0 in /etc/sysctl.d"))
+        self.assertFalse(eligible("Uvicorn needs edge_backend on sys.path for nested module resolution"))
+        self.assertFalse(eligible("Installing libappimage fixes Baloo crashes on KDE Plasma Wayland"))
+        self.assertFalse(eligible("SP621E visualizer captures PipeWire audio for the LED strip"))
+        self.assertFalse(eligible("Android SDK at ~/Android/Sdk with cmdline-tools latest and platform-tools"))
+        self.assertFalse(eligible("Decoder auto-detect: cuda for NVIDIA NVDEC, vaapi for Intel/AMD"))
+        # project facts need two signals
+        self.assertFalse(eligible("asusd must be running for the backlight service", proj=True))
+        self.assertTrue(eligible("asusd and the asus-wmi firmware interface control the keyboard", proj=True))
+
     def test_backfill_from_pacman_log(self):
         log = TMP / "pacman.log"
         log.write_text(

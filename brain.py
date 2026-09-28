@@ -56,10 +56,10 @@ SYSTEM_PROMPT_PATH = BRAIN_DIR / "SYSTEM_PROMPT.md"
 BACKUP_DIR = BRAIN_DIR / "backups"
 OKF_DIR = BRAIN_DIR / "okf"
 
-BRAIN_VERSION = "2.5.0"
+BRAIN_VERSION = "2.5.1"
 OKF_VERSION = "0.2"
 OKF_PRODUCER = f"central-brain/{BRAIN_VERSION}"
-OKF_BUILD_REV = "4"  # bump when bundle rendering changes so existing bundles regenerate
+OKF_BUILD_REV = "5"  # bump when bundle rendering changes so existing bundles regenerate
 
 OLLAMA_EMBED_URL = "http://localhost:11434/api/embed"
 DEFAULT_EMBED_MODEL = "mxbai-embed-large"
@@ -1024,21 +1024,22 @@ def backfill_fact_env(conn=None) -> int:
             done += 1
     return done
 
-# Host-system relevance for kernel/driver drift. Strong signals name kernel-level machinery; weak ones are
-# topic words that also appear in unrelated project facts (a portfolio page mentioning "Plasma").
-SYSTEM_STRONG_RE = re.compile(r"\b(kernel|driver|modprobe|module|udev|firmware|dkms|sysfs|acpi|initramfs|mkinitcpio|grub|"
-                              r"pipewire|wireplumber|bluez|btusb|btmtk|mt7921e?|rtw89\w*|rfkill|asusd|mesa|nvidia-open|"
-                              r"xhci|pcie|d3cold|s2idle|\w[\w-]*\.service|/etc/\S+|/sys/\S+|\d+\.\d+\.\d+-arch\d)\b", re.I)
-SYSTEM_WEAK_RE = re.compile(r"\b(nvidia|wayland|x11|xorg|kwin|plasma|kde|sddm|usb|bluetooth|wi-?fi|suspend|hibernat\w*|"
-                            r"resume|systemd|networkmanager|iwd|linux)\b", re.I)
-SYSTEM_FACT_RE = SYSTEM_STRONG_RE  # used for the kernel annotation in bundle files
+# Kernel-drift relevance: only kernel/driver machinery counts. Deliberately excluded: sysctl keys such as
+# `kernel.yama.*`, "module" in the Python sense, user-space audio (pipewire/wireplumber/bluez) and desktop
+# words (kde, plasma, wayland, sddm) — those facts do not change meaning with the kernel series.
+SYSTEM_STRONG_RE = re.compile(
+    r"\b(kernel(?!\.[a-z])|drivers?|modprobe|kernel[- ]modules?|udev(?:adm)?|firmware|dkms|sysfs|acpi|initramfs|"
+    r"mkinitcpio|grub|btusb|btmtk|mt7921e?|rtw89\w*|rfkill|asusd|asus-wmi|xhci|pcie|d3cold|s2idle|"
+    r"nvidia-open|nvidia-dkms)\b|/sys/\S+|/proc/cmdline|\b[0-9a-f]{4}:[0-9a-f]{4}\b|\b\d+\.\d+\.\d+-arch\d|\blinux[- ]?\d+\.\d+", re.I)
+# NVIDIA-drift relevance: the fact is about the NVIDIA driver/stack itself, not a mention of NVIDIA hardware.
+NVIDIA_FACT_RE = re.compile(r"nvidia[- ]?(open|driver|module|utils|drm|smi|dkms)|nvidia\b.{0,80}\b(drivers?|kernel|egl|gsp|prime|wayland|x11)\b|"
+                            r"\bgsp\b|libEGL|GL\.nvidia", re.I)
+SYSTEM_FACT_RE = SYSTEM_STRONG_RE  # kept for the bundle's kernel annotation
 
 def is_system_fact(text: str, in_project: bool = False) -> bool:
+    """Kernel-drift eligible: >= 1 kernel/driver signal (>= 2 for facts filed under a project)."""
     strong = {m.group(0).lower() for m in SYSTEM_STRONG_RE.finditer(text or "")}
-    weak = {m.group(0).lower() for m in SYSTEM_WEAK_RE.finditer(text or "")}
-    if in_project:
-        return len(strong) >= 2
-    return len(strong) >= 1 or len(weak) >= 2
+    return len(strong) >= (2 if in_project else 1)
 
 def _series(version: str | None, parts: int) -> str | None:
     if not version:
@@ -1047,15 +1048,20 @@ def _series(version: str | None, parts: int) -> str | None:
     return ".".join(nums[:parts]) if len(nums) >= parts else None
 
 def env_drift(fact_text: str, env_row, now_env: dict, in_project: bool = False) -> str | None:
-    """Warning when a host-system fact was recorded on another kernel series (major.minor) or NVIDIA major."""
-    if not env_row or not is_system_fact(fact_text, in_project):
+    """Warning when a host fact was recorded on another kernel series (major.minor), or an NVIDIA-driver fact
+    on another NVIDIA major. The two checks have separate relevance tests (is_system_fact / NVIDIA_FACT_RE)."""
+    if not env_row:
+        return None
+    text = fact_text or ""
+    kernel_ok = is_system_fact(text, in_project)
+    nv_ok = bool(NVIDIA_FACT_RE.search(text))
+    if not (kernel_ok or nv_ok):
         return None
     kernel, nvidia = env_row["kernel"], env_row["nvidia"]
     notes = []
-    if kernel and now_env.get("kernel") and _series(kernel, 2) != _series(now_env["kernel"], 2):
+    if kernel_ok and kernel and now_env.get("kernel") and _series(kernel, 2) != _series(now_env["kernel"], 2):
         notes.append(f"kernel {kernel.split('-')[0]}→{now_env['kernel'].split('-')[0]}")
-    nv_mentioned = re.search(r"nvidia[- ]?(open|driver|module|utils|drm|smi)|nvidia\b.*\b(driver|kernel|egl|gsp|prime|wayland|x11)|\bgsp\b", fact_text or "", re.I)
-    if nv_mentioned and nvidia and now_env.get("nvidia") and _series(nvidia, 1) != _series(now_env["nvidia"], 1):
+    if nv_ok and nvidia and now_env.get("nvidia") and _series(nvidia, 1) != _series(now_env["nvidia"], 1):
         notes.append(f"NVIDIA {nvidia}→{now_env['nvidia']}")
     return ("recorded on " + ", ".join(notes)) if notes else None
 
@@ -1880,7 +1886,7 @@ def okf_render_concept(c: dict) -> str:
             ent = f" ({f['entity']})" if len(c.get("entities") or []) > 1 else ""
             envtag = ""
             if f.get("kernel") and is_system_fact(str(f["fact"]), c["concept_id"].startswith("projects/")):
-                envtag = f" (kernel {f['kernel'].split('-')[0]}" + (f", NVIDIA {f['nvidia']}" if f.get("nvidia") and re.search(r"nvidia|cuda|gsp|nvdec|nvenc|prime", str(f["fact"]), re.I) else "") + ")"
+                envtag = f" (kernel {f['kernel'].split('-')[0]}" + (f", NVIDIA {f['nvidia']}" if f.get("nvidia") and NVIDIA_FACT_RE.search(str(f["fact"])) else "") + ")"
             lines.append(f"- [#{f['id']}] {_fact_date(f['timestamp'])}{extra}{ent}{envtag} · {' '.join(str(f['fact']).split())}")
         lines.append("")
     if c.get("map_outline"):
